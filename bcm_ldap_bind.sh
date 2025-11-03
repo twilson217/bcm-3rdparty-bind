@@ -10,6 +10,7 @@
 #   bcm_ldap_bind.sh --discovery    Test discovery of head nodes and software images
 #   bcm_ldap_bind.sh --dry-run      Preview what changes would be made
 #   bcm_ldap_bind.sh --write        Apply the configuration changes
+#   bcm_ldap_bind.sh --validate     Validate LDAP is working correctly
 #
 
 set -euo pipefail
@@ -33,11 +34,13 @@ usage() {
     echo "  --discovery    Test discovery of head nodes, software images, and compute nodes"
     echo "  --dry-run      Preview what changes would be made without modifying anything"
     echo "  --write        Apply the LDAP bind credentials configuration"
+    echo "  --validate     Validate that LDAP and bind authentication are working correctly"
     echo ""
     echo "Examples:"
     echo "  $0 --discovery    # Test the discovery logic"
     echo "  $0 --dry-run      # See what would be changed"
     echo "  sudo $0 --write   # Apply the changes (requires root)"
+    echo "  sudo $0 --validate # Validate LDAP is working (requires root)"
     echo ""
     exit 1
 }
@@ -55,6 +58,9 @@ case "$1" in
         ;;
     --write)
         MODE="write"
+        ;;
+    --validate)
+        MODE="validate"
         ;;
     -h|--help)
         usage
@@ -532,6 +538,211 @@ if [[ "$MODE" == "dryrun" ]]; then
     echo ""
     
     exit 0
+fi
+
+# ============================================================================
+# VALIDATE MODE - Test LDAP and Bind Authentication
+# ============================================================================
+
+if [[ "$MODE" == "validate" ]]; then
+    # Ensure the script is run as root
+    if [[ $EUID -ne 0 ]]; then
+       log_error "Validate mode must be run as root."
+       log_error "Please run: sudo $0 --validate"
+       exit 1
+    fi
+    
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}          VALIDATE MODE - Testing LDAP Configuration${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    log_info "Starting LDAP validation tests..."
+    echo ""
+    
+    VALIDATION_FAILED=0
+    
+    # ============================================================================
+    # TEST 1: Validate LDAP on Head Node
+    # ============================================================================
+    log_info "Test 1: Validating LDAP on head node"
+    echo ""
+    
+    # Test nslcd service
+    if systemctl is-active --quiet nslcd 2>/dev/null; then
+        log_info "✓ nslcd service is running on head node"
+    else
+        log_error "✗ nslcd service is not running on head node"
+        VALIDATION_FAILED=1
+    fi
+    
+    # Test getent passwd lookup
+    if getent passwd cmsupport >/dev/null 2>&1; then
+        log_info "✓ User lookup via nslcd works on head node (getent passwd)"
+    else
+        log_error "✗ User lookup via nslcd failed on head node"
+        VALIDATION_FAILED=1
+    fi
+    
+    # Test certificate-based ldapsearch (SASL EXTERNAL)
+    if ldapsearch uid=cmsupport >/dev/null 2>&1; then
+        log_info "✓ Certificate-based LDAP search works (SASL EXTERNAL)"
+    else
+        log_error "✗ Certificate-based LDAP search failed"
+        VALIDATION_FAILED=1
+    fi
+    
+    # ============================================================================
+    # TEST 2: Validate LDAP on All UP Compute Nodes
+    # ============================================================================
+    echo ""
+    log_info "Test 2: Validating LDAP on compute nodes"
+    echo ""
+    
+    # Discover compute nodes that are UP
+    compute_nodes=$(cmsh -c "device list" | awk '$1 != "HeadNode" && NF >= 2 { print $2 }')
+    
+    if [[ -n "$compute_nodes" ]]; then
+        up_nodes=$(cmsh -c "device status" | grep -E "\[\s*UP\s*\]" | awk '{print $1}' | grep -v "HeadNode")
+        
+        if [[ -n "$up_nodes" ]]; then
+            while IFS= read -r node; do
+                if [[ -n "$node" ]]; then
+                    log_info "Testing node: $node"
+                    
+                    # Test nslcd service on node
+                    if ssh "$node" "systemctl is-active --quiet nslcd 2>/dev/null"; then
+                        log_info "  ✓ nslcd service is running"
+                    else
+                        log_error "  ✗ nslcd service is not running"
+                        VALIDATION_FAILED=1
+                    fi
+                    
+                    # Test getent on node
+                    if ssh "$node" "getent passwd cmsupport >/dev/null 2>&1"; then
+                        log_info "  ✓ User lookup via nslcd works"
+                    else
+                        log_error "  ✗ User lookup via nslcd failed"
+                        VALIDATION_FAILED=1
+                    fi
+                fi
+            done <<< "$up_nodes"
+        else
+            log_warn "No compute nodes are currently UP - skipping node tests"
+        fi
+    else
+        log_info "No compute nodes found in cluster"
+    fi
+    
+    # ============================================================================
+    # TEST 3: Validate Bind Credentials Authentication
+    # ============================================================================
+    echo ""
+    log_info "Test 3: Validating bind credentials authentication"
+    echo ""
+    
+    TEST_USER="bind-test-user"
+    TEST_PASS="testpass"
+    
+    log_info "Creating temporary test user: $TEST_USER"
+    
+    # Create test user
+    if cmsh -c "user; add $TEST_USER; set password $TEST_PASS; commit" >/dev/null 2>&1; then
+        log_info "✓ Test user created successfully"
+        
+        # Wait a moment for LDAP to sync
+        sleep 2
+        
+        # Test bind authentication with ldapsearch
+        log_info "Testing bind authentication with ldapsearch..."
+        
+        if ldapsearch -D "uid=$TEST_USER,dc=cm,dc=cluster" -w "$TEST_PASS" -H ldaps://ldapserver:636 uid=cmsupport >/dev/null 2>&1; then
+            log_info "✓ Bind authentication works with user credentials"
+        else
+            log_error "✗ Bind authentication failed"
+            log_error "  Command attempted: ldapsearch -D uid=$TEST_USER,dc=cm,dc=cluster -w <password> -H ldaps://ldapserver:636 uid=cmsupport"
+            VALIDATION_FAILED=1
+        fi
+        
+        # Clean up test user
+        log_info "Removing test user: $TEST_USER"
+        if cmsh -c "user; remove $TEST_USER; commit" >/dev/null 2>&1; then
+            log_info "✓ Test user removed successfully"
+        else
+            log_warn "⚠ Failed to remove test user - you may need to remove it manually"
+            log_warn "  Run: cmsh -c 'user; remove $TEST_USER; commit'"
+        fi
+    else
+        log_error "✗ Failed to create test user"
+        VALIDATION_FAILED=1
+    fi
+    
+    # ============================================================================
+    # TEST 4: Verify slapd Configuration
+    # ============================================================================
+    echo ""
+    log_info "Test 4: Verifying slapd configuration"
+    echo ""
+    
+    slapd_conf="/cm/local/apps/openldap/etc/slapd.conf"
+    
+    if [[ -f "$slapd_conf" ]]; then
+        if grep -q "^TLSVerifyClient try" "$slapd_conf"; then
+            log_info "✓ TLSVerifyClient is set to 'try'"
+        else
+            log_error "✗ TLSVerifyClient is not set to 'try'"
+            VALIDATION_FAILED=1
+        fi
+        
+        if grep -q "^require authc" "$slapd_conf"; then
+            log_info "✓ 'require authc' is present"
+        else
+            log_error "✗ 'require authc' is not present"
+            VALIDATION_FAILED=1
+        fi
+        
+        if systemctl is-active --quiet slapd 2>/dev/null; then
+            log_info "✓ slapd service is running"
+        else
+            log_error "✗ slapd service is not running"
+            VALIDATION_FAILED=1
+        fi
+    else
+        log_error "✗ slapd.conf not found at $slapd_conf"
+        VALIDATION_FAILED=1
+    fi
+    
+    # ============================================================================
+    # SUMMARY
+    # ============================================================================
+    echo ""
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}                   Validation Summary${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    if [[ $VALIDATION_FAILED -eq 0 ]]; then
+        echo -e "${GREEN}✓ ALL VALIDATION TESTS PASSED${NC}"
+        echo ""
+        log_info "LDAP is configured correctly and working as expected:"
+        log_info "  ✓ Certificate-based authentication (SASL EXTERNAL) works"
+        log_info "  ✓ Bind credentials authentication works"
+        log_info "  ✓ nslcd is working on all UP nodes"
+        log_info "  ✓ User lookups work via getent"
+        log_info "  ✓ slapd configuration is correct"
+        echo ""
+        exit 0
+    else
+        echo -e "${RED}✗ VALIDATION FAILED${NC}"
+        echo ""
+        log_error "One or more validation tests failed."
+        log_error "Please review the errors above and check:"
+        log_error "  1. Service logs: journalctl -u nslcd -u slapd"
+        log_error "  2. Configuration files in /etc and software images"
+        log_error "  3. Network connectivity between nodes"
+        echo ""
+        exit 1
+    fi
 fi
 
 # ============================================================================

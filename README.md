@@ -15,6 +15,9 @@ Based on: [Bright Computing KB Article](https://kb.brightcomputing.com/knowledge
 
 # Apply configuration (requires root)
 sudo ./bcm_ldap_bind.sh --write
+
+# Validate LDAP is working (requires root)
+sudo ./bcm_ldap_bind.sh --validate
 ```
 
 ## Prerequisites
@@ -82,6 +85,22 @@ The script will:
 - Push changes to running compute nodes
 - Restart affected services
 - Provide a summary of all changes
+
+### Validate Mode
+
+Validate that LDAP and bind authentication are working correctly:
+
+```bash
+sudo ./bcm_ldap_bind.sh --validate
+```
+
+This performs comprehensive tests:
+- **Test 1:** Validates LDAP on head node (nslcd service, user lookup, certificate auth)
+- **Test 2:** Validates LDAP on all UP compute nodes (nslcd service, user lookup)
+- **Test 3:** Creates a temporary test user and validates bind credentials authentication
+- **Test 4:** Verifies slapd configuration (TLSVerifyClient, require authc, service status)
+
+The test user is automatically cleaned up after validation.
 
 ### Help
 
