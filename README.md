@@ -95,12 +95,22 @@ sudo ./bcm_ldap_bind.sh --validate
 ```
 
 This performs comprehensive tests:
-- **Test 1:** Validates LDAP on head node (nslcd service, user lookup, certificate auth)
-- **Test 2:** Validates LDAP on all UP compute nodes (nslcd service, user lookup)
-- **Test 3:** Creates a temporary test user and validates bind credentials authentication
-- **Test 4:** Verifies slapd configuration (TLSVerifyClient, require authc, service status)
-
-The test user is automatically cleaned up after validation.
+- **Test 1:** Validates LDAP on head node
+  - nslcd service running
+  - User lookup via getent
+  - Direct certificate-based ldapsearch (SASL EXTERNAL)
+- **Test 2:** Validates LDAP on all UP compute nodes
+  - nslcd service running
+  - User lookup via nslcd/getent (uses certificate auth)
+  - Verifies nslcd.conf has `sasl_mech external` configured
+- **Test 3:** Validates bind credentials authentication
+  - Creates temporary test user
+  - Tests ldapsearch with bind credentials
+  - Automatically cleans up test user
+- **Test 4:** Verifies slapd configuration
+  - TLSVerifyClient set to 'try'
+  - 'require authc' present
+  - slapd service running
 
 ### Help
 

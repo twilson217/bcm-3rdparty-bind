@@ -618,11 +618,19 @@ if [[ "$MODE" == "validate" ]]; then
                         VALIDATION_FAILED=1
                     fi
                     
-                    # Test getent on node
+                    # Test getent on node (this uses nslcd with certificate auth)
                     if ssh "$node" "getent passwd cmsupport >/dev/null 2>&1"; then
-                        log_info "  ✓ User lookup via nslcd works"
+                        log_info "  ✓ User lookup via nslcd works (certificate-based)"
                     else
                         log_error "  ✗ User lookup via nslcd failed"
+                        VALIDATION_FAILED=1
+                    fi
+                    
+                    # Verify nslcd is configured with sasl_mech external
+                    if ssh "$node" "grep -q '^sasl_mech external' /etc/nslcd.conf 2>/dev/null"; then
+                        log_info "  ✓ nslcd.conf has 'sasl_mech external' configured"
+                    else
+                        log_error "  ✗ nslcd.conf missing 'sasl_mech external'"
                         VALIDATION_FAILED=1
                     fi
                 fi
@@ -725,10 +733,10 @@ if [[ "$MODE" == "validate" ]]; then
         echo -e "${GREEN}✓ ALL VALIDATION TESTS PASSED${NC}"
         echo ""
         log_info "LDAP is configured correctly and working as expected:"
-        log_info "  ✓ Certificate-based authentication (SASL EXTERNAL) works"
+        log_info "  ✓ Certificate-based authentication (SASL EXTERNAL) works on head node"
         log_info "  ✓ Bind credentials authentication works"
-        log_info "  ✓ nslcd is working on all UP nodes"
-        log_info "  ✓ User lookups work via getent"
+        log_info "  ✓ nslcd is configured with certificate auth (sasl_mech external) on all UP nodes"
+        log_info "  ✓ User lookups work via nslcd/getent on all UP nodes"
         log_info "  ✓ slapd configuration is correct"
         echo ""
         exit 0
