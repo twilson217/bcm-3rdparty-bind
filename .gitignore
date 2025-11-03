@@ -1,0 +1,14 @@
+# BCM documentation (reference only, not part of the project)
+.bcm-docs/
+
+# Backup files created by the script
+*.backup.*
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# Test artifacts
+test_output/
+
