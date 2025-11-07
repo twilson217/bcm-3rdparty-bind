@@ -137,23 +137,46 @@ get_software_image_paths() {
 # Function to update openldap ldap.conf with SASL external authentication
 update_ldap_conf() {
     local conf_file="$1"
+    local actual_file="$conf_file"
     
-    if [[ ! -f "$conf_file" ]]; then
-        log_warn "File not found: $conf_file - skipping"
+    # If it's a symlink, resolve to the actual file
+    if [[ -L "$conf_file" ]]; then
+        # Check if this is within a software image path
+        if [[ "$conf_file" =~ ^/cm/images/[^/]+ ]]; then
+            # In an image: resolve symlink relative to image root
+            local link_target=$(readlink "$conf_file")
+            if [[ "$link_target" == /* ]]; then
+                # Absolute symlink: prepend image root
+                local image_root=$(echo "$conf_file" | sed 's|\(/cm/images/[^/]*\)/.*|\1|')
+                actual_file="${image_root}${link_target}"
+            else
+                # Relative symlink: resolve relative to symlink's directory
+                actual_file="$(dirname "$conf_file")/$link_target"
+            fi
+            log_info "  $conf_file is a symlink, updating actual file: $actual_file"
+        else
+            # Not in an image: use standard resolution
+            actual_file=$(readlink -f "$conf_file")
+            log_info "  $conf_file is a symlink, updating actual file: $actual_file"
+        fi
+    fi
+    
+    if [[ ! -f "$actual_file" ]]; then
+        log_warn "File not found: $actual_file - skipping"
         return 1
     fi
     
-    if grep -q "^SASL_MECH external" "$conf_file" 2>/dev/null; then
-        log_info "SASL_MECH external already present in $conf_file"
+    if grep -q "^SASL_MECH external" "$actual_file" 2>/dev/null; then
+        log_info "SASL_MECH external already present in $actual_file"
         return 0
     else
-        log_info "Adding 'SASL_MECH external' to $conf_file"
+        log_info "Adding 'SASL_MECH external' to $actual_file"
         # Create backup
-        cp "$conf_file" "${conf_file}.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$actual_file" "${actual_file}.backup.$(date +%Y%m%d_%H%M%S)"
         # Add configuration
-        echo "" >> "$conf_file"
-        echo "# Force external authentication by default (added by bcm_ldap_bind.sh)" >> "$conf_file"
-        echo "SASL_MECH external" >> "$conf_file"
+        echo "" >> "$actual_file"
+        echo "# Force external authentication by default (added by bcm_ldap_bind.sh)" >> "$actual_file"
+        echo "SASL_MECH external" >> "$actual_file"
         return 0
     fi
 }
@@ -1068,56 +1091,118 @@ if [[ "$MODE" == "write" ]]; then
     fi
     
     # ============================================================================
-    # STEP 6: Update slapd Configuration for Bind Authentication
+    # STEP 6: Update slapd Configuration for Bind Authentication on All Head Nodes
     # ============================================================================
     echo ""
-    log_info "Step 6: Configuring slapd.conf for bind authentication"
+    log_info "Step 6: Configuring slapd.conf for bind authentication on all head nodes"
     
+    head_nodes=$(discover_head_nodes)
+    current_hostname=$(hostname -s)
     slapd_conf="/cm/local/apps/openldap/etc/slapd.conf"
     
-    if [[ -f "$slapd_conf" ]]; then
-        log_info "Found slapd.conf, updating configuration..."
+    for node in $head_nodes; do
+        log_info "Processing head node: $node"
         
-        cp "$slapd_conf" "${slapd_conf}.backup.$(date +%Y%m%d_%H%M%S)"
-        
-        if grep -q "^TLSVerifyClient" "$slapd_conf"; then
-            if grep -q "^TLSVerifyClient try" "$slapd_conf"; then
-                log_info "TLSVerifyClient already set to 'try'"
+        if [[ "$node" == "$current_hostname" ]]; then
+            # Local head node - update directly
+            if [[ -f "$slapd_conf" ]]; then
+                log_info "Found slapd.conf, updating configuration..."
+                
+                cp "$slapd_conf" "${slapd_conf}.backup.$(date +%Y%m%d_%H%M%S)"
+                
+                if grep -q "^TLSVerifyClient" "$slapd_conf"; then
+                    if grep -q "^TLSVerifyClient try" "$slapd_conf"; then
+                        log_info "TLSVerifyClient already set to 'try'"
+                    else
+                        log_info "Updating TLSVerifyClient to 'try'"
+                        sed -i 's/^TLSVerifyClient .*/TLSVerifyClient try/' "$slapd_conf"
+                    fi
+                else
+                    log_info "Adding TLSVerifyClient try"
+                    if grep -q "^TLSCertificateFile" "$slapd_conf"; then
+                        sed -i '/^TLSCertificateFile/a TLSVerifyClient try' "$slapd_conf"
+                    else
+                        echo "TLSVerifyClient try" >> "$slapd_conf"
+                    fi
+                fi
+                
+                if grep -q "^require authc" "$slapd_conf"; then
+                    log_info "require authc already present in slapd.conf"
+                else
+                    log_info "Adding 'require authc' to slapd.conf"
+                    if grep -q "^access to" "$slapd_conf"; then
+                        sed -i '0,/^access to/s/^access to/require authc\n\naccess to/' "$slapd_conf"
+                    else
+                        echo "" >> "$slapd_conf"
+                        echo "# Require authentication" >> "$slapd_conf"
+                        echo "require authc" >> "$slapd_conf"
+                    fi
+                fi
+                
+                if systemctl cat slapd.service >/dev/null 2>&1; then
+                    log_info "Restarting slapd service on $node..."
+                    systemctl restart slapd && log_info "✓ slapd restarted on $node" || log_warn "Failed to restart slapd on $node"
+                else
+                    log_warn "slapd service not found on $node"
+                fi
             else
-                log_info "Updating TLSVerifyClient to 'try'"
-                sed -i 's/^TLSVerifyClient .*/TLSVerifyClient try/' "$slapd_conf"
+                log_warn "slapd.conf not found at $slapd_conf on $node"
             fi
         else
-            log_info "Adding TLSVerifyClient try"
-            if grep -q "^TLSCertificateFile" "$slapd_conf"; then
-                sed -i '/^TLSCertificateFile/a TLSVerifyClient try' "$slapd_conf"
+            # Remote head node - update via SSH
+            if ssh -n "$node" "test -f $slapd_conf" 2>/dev/null; then
+                log_info "Found slapd.conf on $node, updating configuration..."
+                
+                # Create backup on remote node
+                ssh -n "$node" "cp $slapd_conf ${slapd_conf}.backup.\$(date +%Y%m%d_%H%M%S)" 2>/dev/null || log_warn "Failed to create backup on $node"
+                
+                # Check and update TLSVerifyClient
+                if ssh -n "$node" "grep -q '^TLSVerifyClient' $slapd_conf" 2>/dev/null; then
+                    if ssh -n "$node" "grep -q '^TLSVerifyClient try' $slapd_conf" 2>/dev/null; then
+                        log_info "TLSVerifyClient already set to 'try' on $node"
+                    else
+                        log_info "Updating TLSVerifyClient to 'try' on $node"
+                        ssh -n "$node" "sed -i 's/^TLSVerifyClient .*/TLSVerifyClient try/' $slapd_conf" 2>/dev/null || log_warn "Failed to update TLSVerifyClient on $node"
+                    fi
+                else
+                    log_info "Adding TLSVerifyClient try on $node"
+                    if ssh -n "$node" "grep -q '^TLSCertificateFile' $slapd_conf" 2>/dev/null; then
+                        ssh -n "$node" "sed -i '/^TLSCertificateFile/a TLSVerifyClient try' $slapd_conf" 2>/dev/null || log_warn "Failed to add TLSVerifyClient on $node"
+                    else
+                        ssh -n "$node" "echo 'TLSVerifyClient try' >> $slapd_conf" 2>/dev/null || log_warn "Failed to add TLSVerifyClient on $node"
+                    fi
+                fi
+                
+                # Check and update require authc
+                if ssh -n "$node" "grep -q '^require authc' $slapd_conf" 2>/dev/null; then
+                    log_info "require authc already present in slapd.conf on $node"
+                else
+                    log_info "Adding 'require authc' to slapd.conf on $node"
+                    if ssh -n "$node" "grep -q '^access to' $slapd_conf" 2>/dev/null; then
+                        ssh -n "$node" "sed -i '0,/^access to/s/^access to/require authc\n\naccess to/' $slapd_conf" 2>/dev/null || log_warn "Failed to add require authc on $node"
+                    else
+                        ssh -n "$node" "printf '\n# Require authentication\nrequire authc\n' >> $slapd_conf" 2>/dev/null || log_warn "Failed to add require authc on $node"
+                    fi
+                fi
+                
+                # Restart slapd on remote node
+                if ssh -n "$node" "systemctl cat slapd.service >/dev/null 2>&1"; then
+                    log_info "Restarting slapd service on $node..."
+                    if ssh -n "$node" "systemctl restart slapd" 2>/dev/null; then
+                        log_info "✓ slapd restarted on $node"
+                    else
+                        log_warn "Failed to restart slapd on $node"
+                    fi
+                else
+                    log_warn "slapd service not found on $node"
+                fi
             else
-                echo "TLSVerifyClient try" >> "$slapd_conf"
+                log_warn "slapd.conf not found at $slapd_conf on $node"
             fi
         fi
         
-        if grep -q "^require authc" "$slapd_conf"; then
-            log_info "require authc already present in slapd.conf"
-        else
-            log_info "Adding 'require authc' to slapd.conf"
-            if grep -q "^access to" "$slapd_conf"; then
-                sed -i '/^access to/i require authc' "$slapd_conf"
-            else
-                echo "" >> "$slapd_conf"
-                echo "# Require authentication" >> "$slapd_conf"
-                echo "require authc" >> "$slapd_conf"
-            fi
-        fi
-        
-        if systemctl cat slapd.service >/dev/null 2>&1; then
-            log_info "Restarting slapd service..."
-            systemctl restart slapd || log_warn "Failed to restart slapd service"
-        else
-            log_warn "slapd service not found, you may need to restart it manually"
-        fi
-    else
-        log_warn "slapd.conf not found at $slapd_conf"
-    fi
+        echo ""
+    done
     
     echo ""
     echo "═══════════════════════════════════════════════════════════"
@@ -1139,8 +1224,8 @@ if [[ "$MODE" == "write" ]]; then
     if systemctl cat sssd.service >/dev/null 2>&1; then
         log_info "  ✓ Updated SSSD configuration (if applicable)"
     fi
-    log_info "  ✓ Updated slapd.conf for bind authentication (TLSVerifyClient=try, require authc)"
-    log_info "  ✓ Restarted slapd service"
+    log_info "  ✓ Updated slapd.conf for bind authentication on all head nodes (TLSVerifyClient=try, require authc)"
+    log_info "  ✓ Restarted slapd service on all head nodes"
     echo ""
     log_info "Backup files have been created with timestamp suffixes:"
     log_info "  Find backups with: find /etc /cm -name '*.backup.*' -type f 2>/dev/null"
@@ -1197,26 +1282,49 @@ if [[ "$MODE" == "rollback" ]]; then
     # Function to restore a file from backup
     restore_from_backup() {
         local conf_file="$1"
+        local actual_file="$conf_file"
         
-        if [[ ! -f "$conf_file" ]]; then
-            log_warn "File not found: $conf_file - skipping"
+        # If it's a symlink, resolve to the actual file
+        if [[ -L "$conf_file" ]]; then
+            # Check if this is within a software image path
+            if [[ "$conf_file" =~ ^/cm/images/[^/]+ ]]; then
+                # In an image: resolve symlink relative to image root
+                local link_target=$(readlink "$conf_file")
+                if [[ "$link_target" == /* ]]; then
+                    # Absolute symlink: prepend image root
+                    local image_root=$(echo "$conf_file" | sed 's|\(/cm/images/[^/]*\)/.*|\1|')
+                    actual_file="${image_root}${link_target}"
+                else
+                    # Relative symlink: resolve relative to symlink's directory
+                    actual_file="$(dirname "$conf_file")/$link_target"
+                fi
+                log_info "  $conf_file is a symlink, restoring actual file: $actual_file"
+            else
+                # Not in an image: use standard resolution
+                actual_file=$(readlink -f "$conf_file")
+                log_info "  $conf_file is a symlink, restoring actual file: $actual_file"
+            fi
+        fi
+        
+        if [[ ! -f "$actual_file" ]]; then
+            log_warn "File not found: $actual_file - skipping"
             return 1
         fi
         
         # Find the most recent backup file
-        local backup_file=$(find "$(dirname "$conf_file")" -maxdepth 1 -name "$(basename "$conf_file").backup.*" -type f 2>/dev/null | sort -r | head -n 1)
+        local backup_file=$(find "$(dirname "$actual_file")" -maxdepth 1 -name "$(basename "$actual_file").backup.*" -type f 2>/dev/null | sort -r | head -n 1)
         
         if [[ -n "$backup_file" && -f "$backup_file" ]]; then
-            log_info "Restoring $conf_file from backup: $backup_file"
-            cp "$backup_file" "$conf_file" || {
-                log_error "Failed to restore $conf_file"
+            log_info "Restoring $actual_file from backup: $backup_file"
+            cp "$backup_file" "$actual_file" || {
+                log_error "Failed to restore $actual_file"
                 ROLLBACK_FAILED=1
                 return 1
             }
             FILES_RESTORED=$((FILES_RESTORED + 1))
             return 0
         else
-            log_warn "No backup found for $conf_file"
+            log_warn "No backup found for $actual_file"
             return 1
         fi
     }
@@ -1225,29 +1333,51 @@ if [[ "$MODE" == "rollback" ]]; then
     remove_script_additions() {
         local conf_file="$1"
         local marker="$2"
+        local actual_file="$conf_file"
         
-        if [[ ! -f "$conf_file" ]]; then
-            return 1
+        # If it's a symlink, resolve to the actual file
+        if [[ -L "$conf_file" ]]; then
+            # Check if this is within a software image path
+            if [[ "$conf_file" =~ ^/cm/images/[^/]+ ]]; then
+                # In an image: resolve symlink relative to image root
+                local link_target=$(readlink "$conf_file")
+                if [[ "$link_target" == /* ]]; then
+                    # Absolute symlink: prepend image root
+                    local image_root=$(echo "$conf_file" | sed 's|\(/cm/images/[^/]*\)/.*|\1|')
+                    actual_file="${image_root}${link_target}"
+                else
+                    # Relative symlink: resolve relative to symlink's directory
+                    actual_file="$(dirname "$conf_file")/$link_target"
+                fi
+                log_info "  $conf_file is a symlink, updating actual file: $actual_file"
+            else
+                # Not in an image: use standard resolution
+                actual_file=$(readlink -f "$conf_file")
+                log_info "  $conf_file is a symlink, updating actual file: $actual_file"
+            fi
         fi
         
-        if grep -q "$marker" "$conf_file" 2>/dev/null; then
-            log_info "Removing lines added by script from $conf_file"
+        if [[ ! -f "$actual_file" ]]; then
+            return 0  # File doesn't exist, nothing to remove - not an error
+        fi
+        
+        if grep -q "$marker" "$actual_file" 2>/dev/null; then
+            log_info "Removing lines added by script from $actual_file"
             
             # Create a safety backup
-            cp "$conf_file" "${conf_file}.pre-rollback.$(date +%Y%m%d_%H%M%S)"
+            cp "$actual_file" "${actual_file}.pre-rollback.$(date +%Y%m%d_%H%M%S)"
             
             # Remove the comment line and the configuration line after it
-            sed -i "/# Force external authentication by default (added by bcm_ldap_bind.sh)/,/^SASL_MECH external/d" "$conf_file" 2>/dev/null || true
-            sed -i "/# Use certificate as auth (added by bcm_ldap_bind.sh)/,/^sasl_mech external/d" "$conf_file" 2>/dev/null || true
-            sed -i "/ldap_sasl_mech = EXTERNAL/d" "$conf_file" 2>/dev/null || true
-            sed -i "/# Require authentication/d" "$conf_file" 2>/dev/null || true
-            sed -i "/^require authc$/d" "$conf_file" 2>/dev/null || true
+            sed -i "/# Force external authentication by default (added by bcm_ldap_bind.sh)/,/^SASL_MECH external/d" "$actual_file" 2>/dev/null || true
+            sed -i "/# Use certificate as auth (added by bcm_ldap_bind.sh)/,/^sasl_mech external/d" "$actual_file" 2>/dev/null || true
+            sed -i "/ldap_sasl_mech = EXTERNAL/d" "$actual_file" 2>/dev/null || true
+            sed -i "/# Require authentication/d" "$actual_file" 2>/dev/null || true
+            sed -i "/^require authc$/d" "$actual_file" 2>/dev/null || true
             
             FILES_RESTORED=$((FILES_RESTORED + 1))
-            return 0
         fi
         
-        return 1
+        return 0  # Always return success for rollback
     }
     
     # ============================================================================
@@ -1256,30 +1386,82 @@ if [[ "$MODE" == "rollback" ]]; then
     echo ""
     log_info "Step 1: Restoring OpenLDAP client (ldap.conf) on head nodes"
     
-    if [[ -f "/etc/openldap/ldap.conf" ]]; then
-        if ! restore_from_backup "/etc/openldap/ldap.conf"; then
-            remove_script_additions "/etc/openldap/ldap.conf" "SASL_MECH external"
+    head_nodes=$(discover_head_nodes)
+    current_hostname=$(hostname -s)
+    
+    for node in $head_nodes; do
+        log_info "Processing head node: $node"
+        
+        if [[ "$node" == "$current_hostname" ]]; then
+            # Local head node
+            if [[ -f "/etc/openldap/ldap.conf" ]]; then
+                if ! restore_from_backup "/etc/openldap/ldap.conf"; then
+                    remove_script_additions "/etc/openldap/ldap.conf" "SASL_MECH external"
+                fi
+            fi
+        else
+            # Remote head node
+            if ssh -n "$node" "test -f /etc/openldap/ldap.conf" 2>/dev/null; then
+                log_info "Restoring ldap.conf on $node..."
+                
+                # Try to find and restore from backup on remote node
+                backup_file=$(ssh -n "$node" "find /etc/openldap -maxdepth 1 -name 'ldap.conf.backup.*' -type f 2>/dev/null | sort -r | head -n 1" 2>/dev/null)
+                
+                if [[ -n "$backup_file" ]]; then
+                    log_info "Restoring from backup: $backup_file"
+                    ssh -n "$node" "cp '$backup_file' /etc/openldap/ldap.conf" 2>/dev/null && log_info "✓ Restored ldap.conf on $node" || log_warn "Failed to restore ldap.conf on $node"
+                    FILES_RESTORED=$((FILES_RESTORED + 1))
+                else
+                    log_warn "No backup found on $node, attempting to remove script additions..."
+                    ssh -n "$node" "sed -i '/# Force external authentication by default (added by bcm_ldap_bind.sh)/,/^SASL_MECH external/d' /etc/openldap/ldap.conf" 2>/dev/null && FILES_RESTORED=$((FILES_RESTORED + 1))
+                fi
+            fi
         fi
-    fi
+    done
     
     # ============================================================================
     # STEP 2: Restore nslcd configuration on head nodes
     # ============================================================================
     echo ""
     log_info "Step 2: Restoring nslcd.conf on head nodes"
-    head_nodes=$(discover_head_nodes)
     
     for node in $head_nodes; do
         log_info "Processing head node: $node"
         
-        if [[ -f "/etc/nslcd.conf" ]]; then
-            if ! restore_from_backup "/etc/nslcd.conf"; then
-                remove_script_additions "/etc/nslcd.conf" "sasl_mech external"
+        if [[ "$node" == "$current_hostname" ]]; then
+            # Local head node
+            if [[ -f "/etc/nslcd.conf" ]]; then
+                if ! restore_from_backup "/etc/nslcd.conf"; then
+                    remove_script_additions "/etc/nslcd.conf" "sasl_mech external"
+                fi
+                
+                if systemctl cat nslcd.service >/dev/null 2>&1; then
+                    log_info "Restarting nslcd service on $node..."
+                    systemctl restart nslcd && log_info "✓ nslcd restarted on $node" || log_warn "Failed to restart nslcd service on $node"
+                fi
             fi
-            
-            if systemctl cat nslcd.service >/dev/null 2>&1; then
-                log_info "Restarting nslcd service..."
-                systemctl restart nslcd || log_warn "Failed to restart nslcd service"
+        else
+            # Remote head node
+            if ssh -n "$node" "test -f /etc/nslcd.conf" 2>/dev/null; then
+                log_info "Restoring nslcd.conf on $node..."
+                
+                # Try to find and restore from backup on remote node
+                backup_file=$(ssh -n "$node" "find /etc -maxdepth 1 -name 'nslcd.conf.backup.*' -type f 2>/dev/null | sort -r | head -n 1" 2>/dev/null)
+                
+                if [[ -n "$backup_file" ]]; then
+                    log_info "Restoring from backup: $backup_file"
+                    ssh -n "$node" "cp '$backup_file' /etc/nslcd.conf" 2>/dev/null && log_info "✓ Restored nslcd.conf on $node" || log_warn "Failed to restore nslcd.conf on $node"
+                    FILES_RESTORED=$((FILES_RESTORED + 1))
+                else
+                    log_warn "No backup found on $node, attempting to remove script additions..."
+                    ssh -n "$node" "sed -i '/# Use certificate as auth (added by bcm_ldap_bind.sh)/,/^sasl_mech external/d' /etc/nslcd.conf" 2>/dev/null && FILES_RESTORED=$((FILES_RESTORED + 1))
+                fi
+                
+                # Restart nslcd service on remote node
+                if ssh -n "$node" "systemctl cat nslcd.service >/dev/null 2>&1" 2>/dev/null; then
+                    log_info "Restarting nslcd service on $node..."
+                    ssh -n "$node" "systemctl restart nslcd" 2>/dev/null && log_info "✓ nslcd restarted on $node" || log_warn "Failed to restart nslcd on $node"
+                fi
             fi
         fi
     done
@@ -1372,41 +1554,83 @@ if [[ "$MODE" == "rollback" ]]; then
     fi
     
     # ============================================================================
-    # STEP 6: Restore slapd configuration
+    # STEP 6: Restore slapd configuration on all head nodes
     # ============================================================================
     echo ""
-    log_info "Step 6: Restoring slapd.conf"
+    log_info "Step 6: Restoring slapd.conf on all head nodes"
     
+    head_nodes=$(discover_head_nodes)
+    current_hostname=$(hostname -s)
     slapd_conf="/cm/local/apps/openldap/etc/slapd.conf"
     
-    if [[ -f "$slapd_conf" ]]; then
-        log_info "Restoring slapd.conf..."
+    for node in $head_nodes; do
+        log_info "Processing head node: $node"
         
-        if ! restore_from_backup "$slapd_conf"; then
-            # If no backup, try to undo the changes manually
-            log_info "No backup found, attempting manual removal of changes..."
-            
-            if grep -q "^TLSVerifyClient try" "$slapd_conf" || grep -q "^require authc" "$slapd_conf"; then
-                cp "$slapd_conf" "${slapd_conf}.pre-rollback.$(date +%Y%m%d_%H%M%S)"
+        if [[ "$node" == "$current_hostname" ]]; then
+            # Local head node - restore directly
+            if [[ -f "$slapd_conf" ]]; then
+                log_info "Restoring slapd.conf..."
                 
-                # This is tricky - we don't know the original TLSVerifyClient value
-                # Best we can do is comment it out or remove it if we added it
-                log_warn "Cannot determine original TLSVerifyClient value"
-                log_warn "You may need to manually verify slapd.conf settings"
+                if ! restore_from_backup "$slapd_conf"; then
+                    # If no backup, try to undo the changes manually
+                    log_info "No backup found, attempting manual removal of changes..."
+                    
+                    if grep -q "^TLSVerifyClient try" "$slapd_conf" || grep -q "^require authc" "$slapd_conf"; then
+                        cp "$slapd_conf" "${slapd_conf}.pre-rollback.$(date +%Y%m%d_%H%M%S)"
+                        
+                        # This is tricky - we don't know the original TLSVerifyClient value
+                        # Best we can do is comment it out or remove it if we added it
+                        log_warn "Cannot determine original TLSVerifyClient value on $node"
+                        log_warn "You may need to manually verify slapd.conf settings on $node"
+                        
+                        # Remove require authc if present
+                        sed -i '/^require authc$/d' "$slapd_conf" 2>/dev/null || true
+                        sed -i '/# Require authentication/d' "$slapd_conf" 2>/dev/null || true
+                        
+                        FILES_RESTORED=$((FILES_RESTORED + 1))
+                    fi
+                fi
                 
-                # Remove require authc if present
-                sed -i '/^require authc$/d' "$slapd_conf" 2>/dev/null || true
-                sed -i '/# Require authentication/d' "$slapd_conf" 2>/dev/null || true
+                if systemctl cat slapd.service >/dev/null 2>&1; then
+                    log_info "Restarting slapd service on $node..."
+                    systemctl restart slapd && log_info "✓ slapd restarted on $node" || log_warn "Failed to restart slapd on $node"
+                fi
+            fi
+        else
+            # Remote head node - restore via SSH
+            if ssh -n "$node" "test -f $slapd_conf" 2>/dev/null; then
+                log_info "Restoring slapd.conf on $node..."
                 
-                FILES_RESTORED=$((FILES_RESTORED + 1))
+                # Try to find and restore from backup on remote node
+                backup_file=$(ssh -n "$node" "find $(dirname "$slapd_conf") -maxdepth 1 -name '$(basename "$slapd_conf").backup.*' -type f 2>/dev/null | sort -r | head -n 1" 2>/dev/null)
+                
+                if [[ -n "$backup_file" ]]; then
+                    log_info "Restoring $slapd_conf from backup on $node: $backup_file"
+                    ssh -n "$node" "cp '$backup_file' $slapd_conf" 2>/dev/null && FILES_RESTORED=$((FILES_RESTORED + 1)) || log_warn "Failed to restore from backup on $node"
+                else
+                    # No backup, try to undo changes manually
+                    log_info "No backup found, attempting manual removal of changes on $node..."
+                    
+                    if ssh -n "$node" "grep -q '^TLSVerifyClient try' $slapd_conf || grep -q '^require authc' $slapd_conf" 2>/dev/null; then
+                        ssh -n "$node" "cp $slapd_conf ${slapd_conf}.pre-rollback.\$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+                        
+                        log_warn "Cannot determine original TLSVerifyClient value on $node"
+                        log_warn "You may need to manually verify slapd.conf settings on $node"
+                        
+                        # Remove require authc if present
+                        ssh -n "$node" "sed -i '/^require authc\$/d' $slapd_conf 2>/dev/null || true; sed -i '/# Require authentication/d' $slapd_conf 2>/dev/null || true" 2>/dev/null && FILES_RESTORED=$((FILES_RESTORED + 1))
+                    fi
+                fi
+                
+                if ssh -n "$node" "systemctl cat slapd.service >/dev/null 2>&1"; then
+                    log_info "Restarting slapd service on $node..."
+                    ssh -n "$node" "systemctl restart slapd" 2>/dev/null && log_info "✓ slapd restarted on $node" || log_warn "Failed to restart slapd on $node"
+                fi
             fi
         fi
         
-        if systemctl cat slapd.service >/dev/null 2>&1; then
-            log_info "Restarting slapd service..."
-            systemctl restart slapd || log_warn "Failed to restart slapd service"
-        fi
-    fi
+        echo ""
+    done
     
     # ============================================================================
     # SUMMARY
@@ -1471,19 +1695,40 @@ if [[ "$MODE" == "rollback-validate" ]]; then
         local conf_file="$1"
         local marker="$2"
         local description="$3"
+        local actual_file="$conf_file"
         
-        if [[ ! -f "$conf_file" ]]; then
-            log_warn "File not found: $conf_file (skipping)"
+        # If it's a symlink, resolve to the actual file
+        if [[ -L "$conf_file" ]]; then
+            # Check if this is within a software image path
+            if [[ "$conf_file" =~ ^/cm/images/[^/]+ ]]; then
+                # In an image: resolve symlink relative to image root
+                local link_target=$(readlink "$conf_file")
+                if [[ "$link_target" == /* ]]; then
+                    # Absolute symlink: prepend image root
+                    local image_root=$(echo "$conf_file" | sed 's|\(/cm/images/[^/]*\)/.*|\1|')
+                    actual_file="${image_root}${link_target}"
+                else
+                    # Relative symlink: resolve relative to symlink's directory
+                    actual_file="$(dirname "$conf_file")/$link_target"
+                fi
+            else
+                # Not in an image: use standard resolution
+                actual_file=$(readlink -f "$conf_file")
+            fi
+        fi
+        
+        if [[ ! -f "$actual_file" ]]; then
+            log_warn "File not found: $actual_file (skipping)"
             return 0
         fi
         
-        if grep -q "$marker" "$conf_file" 2>/dev/null; then
-            log_error "✗ $conf_file still has script-added configuration"
+        if grep -q "$marker" "$actual_file" 2>/dev/null; then
+            log_error "✗ $actual_file still has script-added configuration"
             log_error "  Found: $marker"
             VALIDATION_FAILED=1
             return 1
         else
-            log_info "✓ $conf_file is in original state (no script modifications)"
+            log_info "✓ $actual_file is in original state (no script modifications)"
             return 0
         fi
     }
