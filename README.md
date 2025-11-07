@@ -18,6 +18,12 @@ sudo ./bcm_ldap_bind.sh --write
 
 # Validate LDAP is working (requires root)
 sudo ./bcm_ldap_bind.sh --validate
+
+# Rollback all changes (requires root)
+sudo ./bcm_ldap_bind.sh --rollback
+
+# Verify system is in original state (before changes)
+./bcm_ldap_bind.sh --rollback-validate
 ```
 
 ## Prerequisites
@@ -112,6 +118,69 @@ This performs comprehensive tests:
   - 'require authc' present
   - slapd service running
 
+### Rollback Mode
+
+Undo all changes made by --write mode and restore from backups:
+
+```bash
+sudo ./bcm_ldap_bind.sh --rollback
+```
+
+The rollback process will:
+- Prompt for confirmation before proceeding
+- Restore all configuration files from timestamped backups
+- If backups don't exist, remove lines added by the script
+- Push restored configuration to running compute nodes
+- Restart affected services (nslcd, sssd, slapd)
+- Create pre-rollback safety backups
+- Provide a summary of restored files
+
+**Note:** The rollback mode intelligently handles both scenarios:
+1. **With backups:** Restores files from the most recent `.backup.*` files
+2. **Without backups:** Removes configuration lines added by the script using comment markers
+
+### Rollback-Validate Mode
+
+Verify the system is in its original state (before `--write` changes were applied):
+
+```bash
+./bcm_ldap_bind.sh --rollback-validate
+```
+
+This validation mode checks that:
+- Configuration files do NOT contain script-added modifications
+- Software images are in original state
+- Compute nodes (if UP) are in original state
+- slapd.conf does not have script-added directives
+- Checks for presence of backup files
+
+**Use Cases:**
+1. **Before Changes:** Run this before `--write` to establish a baseline (should pass)
+2. **After Changes:** Run this after `--write` to verify changes were applied (should fail)
+3. **After Rollback:** Run this after `--rollback` to verify restoration (should pass)
+
+**Exit Codes:**
+- `0` = System is in original state (no script modifications detected)
+- `1` = System has been modified by the script (rollback needed)
+
+**Example Workflow:**
+```bash
+# 1. Verify original state
+./bcm_ldap_bind.sh --rollback-validate  # Should PASS
+
+# 2. Apply changes
+sudo ./bcm_ldap_bind.sh --write
+
+# 3. Verify changes were applied
+./bcm_ldap_bind.sh --rollback-validate  # Should FAIL (changes detected)
+
+# 4. Rollback changes
+sudo ./bcm_ldap_bind.sh --rollback
+
+# 5. Verify rollback was successful
+./bcm_ldap_bind.sh --rollback-validate  # Should PASS (back to original)
+```
+
 ### Help
 
 ```bash
@@ -154,16 +223,44 @@ grep "require authc" /cm/local/apps/openldap/etc/slapd.conf
 
 ## Rollback
 
-The script creates timestamped backups of all modified files:
+### Automated Rollback (Recommended)
+
+The script includes a `--rollback` mode that automatically undoes all changes:
 
 ```bash
-# Find backups
+sudo ./bcm_ldap_bind.sh --rollback
+```
+
+This will:
+- Restore all configuration files from timestamped backups
+- Update software images
+- Push changes to running compute nodes
+- Restart all affected services
+- Provide a complete summary
+
+### Manual Rollback (If Needed)
+
+If you prefer manual rollback, the script creates timestamped backups of all modified files:
+
+```bash
+# Find all backup files
 find /etc /cm -name '*.backup.*' -type f 2>/dev/null
 
-# Restore a file
+# Restore individual files
 cp /etc/nslcd.conf.backup.20231103_143025 /etc/nslcd.conf
 systemctl restart nslcd
+
+# Restore slapd.conf
+cp /cm/local/apps/openldap/etc/slapd.conf.backup.20231103_143025 /cm/local/apps/openldap/etc/slapd.conf
+systemctl restart slapd
 ```
+
+### Backup File Locations
+
+The script creates three types of backups:
+1. **`.backup.*`** - Created by `--write` mode before modifying files
+2. **`.pre-rollback.*`** - Safety backups created by `--rollback` mode
+3. Located in same directory as original files
 
 ## Troubleshooting
 
@@ -256,5 +353,5 @@ For issues:
 
 ---
 
-**Version:** 3.0  
-**Last Updated:** November 3, 2025
+**Version:** 3.2  
+**Last Updated:** November 7, 2025

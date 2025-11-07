@@ -31,16 +31,20 @@ usage() {
     echo "Usage: $0 <MODE>"
     echo ""
     echo "Modes:"
-    echo "  --discovery    Test discovery of head nodes, software images, and compute nodes"
-    echo "  --dry-run      Preview what changes would be made without modifying anything"
-    echo "  --write        Apply the LDAP bind credentials configuration"
-    echo "  --validate     Validate that LDAP and bind authentication are working correctly"
+    echo "  --discovery         Test discovery of head nodes, software images, and compute nodes"
+    echo "  --dry-run           Preview what changes would be made without modifying anything"
+    echo "  --write             Apply the LDAP bind credentials configuration"
+    echo "  --validate          Validate that LDAP and bind authentication are working correctly"
+    echo "  --rollback          Undo all changes made by --write mode and restore from backups"
+    echo "  --rollback-validate Verify system is in original state (before --write changes)"
     echo ""
     echo "Examples:"
-    echo "  $0 --discovery    # Test the discovery logic"
-    echo "  $0 --dry-run      # See what would be changed"
-    echo "  sudo $0 --write   # Apply the changes (requires root)"
-    echo "  sudo $0 --validate # Validate LDAP is working (requires root)"
+    echo "  $0 --discovery         # Test the discovery logic"
+    echo "  $0 --dry-run           # See what would be changed"
+    echo "  sudo $0 --write        # Apply the changes (requires root)"
+    echo "  sudo $0 --validate     # Validate LDAP is working (requires root)"
+    echo "  sudo $0 --rollback     # Undo all changes (requires root)"
+    echo "  $0 --rollback-validate # Verify system is in original/rolled-back state"
     echo ""
     exit 1
 }
@@ -61,6 +65,12 @@ case "$1" in
         ;;
     --validate)
         MODE="validate"
+        ;;
+    --rollback)
+        MODE="rollback"
+        ;;
+    --rollback-validate)
+        MODE="rollback-validate"
         ;;
     -h|--help)
         usage
@@ -297,7 +307,7 @@ if [[ "$MODE" == "discovery" ]]; then
     log_test "Testing SSSD Detection"
     echo ""
     
-    if systemctl list-unit-files | grep -q "^sssd.service"; then
+    if systemctl cat sssd.service >/dev/null 2>&1; then
         echo -e "${GREEN}✓${NC} SSSD service file found"
         if systemctl is-active --quiet sssd 2>/dev/null; then
             echo -e "${GREEN}✓${NC} SSSD is active"
@@ -397,7 +407,7 @@ if [[ "$MODE" == "dryrun" ]]; then
         if [[ -f "/etc/nslcd.conf" ]]; then
             check_nslcd_conf "/etc/nslcd.conf"
             
-            if systemctl list-unit-files | grep -q "^nslcd.service"; then
+            if systemctl cat nslcd.service >/dev/null 2>&1; then
                 log_dryrun "  Would restart nslcd service"
             fi
         else
@@ -441,7 +451,7 @@ if [[ "$MODE" == "dryrun" ]]; then
             log_dryrun "Would run imageupdate on $up_count running compute node(s)"
             log_dryrun "  Command: cmsh -c \"device; imageupdate -t physicalnode -s UP -w --wait\""
             log_dryrun "Would restart nslcd on compute nodes"
-            log_dryrun "  Command: cmsh -c \"device; foreach -t physicalnode -s UP * (exec systemctl restart nslcd)\""
+            log_dryrun "  Command: cmsh -c \"device; foreach -t physicalnode -s UP * (pexec systemctl restart nslcd)\""
         else
             log_info "No compute nodes currently UP"
             log_info "Changes will be applied when nodes boot"
@@ -453,7 +463,7 @@ if [[ "$MODE" == "dryrun" ]]; then
     echo ""
     log_info "Step 5: Analyzing SSSD configuration"
     
-    if systemctl list-unit-files | grep -q "^sssd.service"; then
+    if systemctl cat sssd.service >/dev/null 2>&1; then
         if systemctl is-active --quiet sssd 2>/dev/null || systemctl is-enabled --quiet sssd 2>/dev/null; then
             sssd_conf="/etc/sssd/sssd.conf"
             
@@ -508,7 +518,7 @@ if [[ "$MODE" == "dryrun" ]]; then
         
         log_dryrun "  Would create backup: ${slapd_conf}.backup.<timestamp>"
         
-        if systemctl list-unit-files | grep -q "slapd.service"; then
+        if systemctl cat slapd.service >/dev/null 2>&1; then
             log_dryrun "  Would restart slapd service"
         fi
     else
@@ -563,39 +573,71 @@ if [[ "$MODE" == "validate" ]]; then
     VALIDATION_FAILED=0
     
     # ============================================================================
-    # TEST 1: Validate LDAP on Head Node
+    # TEST 1: Validate LDAP on Head Nodes
     # ============================================================================
-    log_info "Test 1: Validating LDAP on head node"
+    log_info "Test 1: Validating LDAP on head nodes"
     echo ""
     
-    # Test nslcd service
-    if systemctl is-active --quiet nslcd 2>/dev/null; then
-        log_info "✓ nslcd service is running on head node"
-    else
-        log_error "✗ nslcd service is not running on head node"
-        VALIDATION_FAILED=1
-    fi
+    head_nodes=$(discover_head_nodes)
+    current_hostname=$(hostname -s)
     
-    # Test getent passwd lookup
-    if getent passwd cmsupport >/dev/null 2>&1; then
-        log_info "✓ User lookup via nslcd works on head node (getent passwd)"
-    else
-        log_error "✗ User lookup via nslcd failed on head node"
-        VALIDATION_FAILED=1
-    fi
+    # Temporarily disable errexit to allow loop to continue on failures
+    set +e
     
-    # Test certificate-based ldapsearch (SASL EXTERNAL)
-    if ldapsearch uid=cmsupport >/dev/null 2>&1; then
-        log_info "✓ Certificate-based LDAP search works (SASL EXTERNAL)"
-    else
-        log_error "✗ Certificate-based LDAP search failed"
-        VALIDATION_FAILED=1
-    fi
+    for node in $head_nodes; do
+        log_info "Testing head node: $node"
+        
+        # Test nslcd service
+        ssh -n "$node" "systemctl is-active --quiet nslcd 2>/dev/null" 2>/dev/null
+        if [[ $? -eq 0 ]]; then
+            log_info "  ✓ nslcd service is running"
+        else
+            log_error "  ✗ nslcd service is not running"
+            VALIDATION_FAILED=1
+        fi
+        
+        # Test LDAP operations (locally for current node, via SSH for remote head node)
+        if [[ "$node" == "$current_hostname" ]]; then
+            getent passwd cmsupport >/dev/null 2>&1
+            if [[ $? -eq 0 ]]; then
+                log_info "  ✓ User lookup via nslcd works (getent passwd)"
+            else
+                log_error "  ✗ User lookup via nslcd failed"
+                VALIDATION_FAILED=1
+            fi
+            ldapsearch uid=cmsupport >/dev/null 2>&1
+            if [[ $? -eq 0 ]]; then
+                log_info "  ✓ Certificate-based LDAP search works (SASL EXTERNAL)"
+            else
+                log_error "  ✗ Certificate-based LDAP search failed"
+                VALIDATION_FAILED=1
+            fi
+        else
+            ssh -n "$node" "getent passwd cmsupport >/dev/null 2>&1" 2>/dev/null
+            if [[ $? -eq 0 ]]; then
+                log_info "  ✓ User lookup via nslcd works (getent passwd)"
+            else
+                log_error "  ✗ User lookup via nslcd failed"
+                VALIDATION_FAILED=1
+            fi
+            ssh -n "$node" "ldapsearch uid=cmsupport >/dev/null 2>&1" 2>/dev/null
+            if [[ $? -eq 0 ]]; then
+                log_info "  ✓ Certificate-based LDAP search works (SASL EXTERNAL)"
+            else
+                log_error "  ✗ Certificate-based LDAP search failed"
+                VALIDATION_FAILED=1
+            fi
+        fi
+        
+        echo ""
+    done
+    
+    # Re-enable errexit
+    set -e
     
     # ============================================================================
     # TEST 2: Validate LDAP on All UP Compute Nodes
     # ============================================================================
-    echo ""
     log_info "Test 2: Validating LDAP on compute nodes"
     echo ""
     
@@ -603,15 +645,37 @@ if [[ "$MODE" == "validate" ]]; then
     compute_nodes=$(cmsh -c "device list" | awk '$1 != "HeadNode" && NF >= 2 { print $2 }')
     
     if [[ -n "$compute_nodes" ]]; then
-        up_nodes=$(cmsh -c "device status" | grep -E "\[\s*UP\s*\]" | awk '{print $1}' | grep -v "HeadNode")
+        up_nodes=$(cmsh -c "device status" | grep -E "\[\s*UP\s*\]" | awk '{print $1}')
+        # Filter out head nodes explicitly
+        filtered_up_nodes=""
+        while IFS= read -r n; do
+            [[ -z "$n" ]] && continue
+            skip=0
+            for hn in $head_nodes; do
+                if [[ "$n" == "$hn" ]]; then
+                    skip=1
+                    break
+                fi
+            done
+            [[ $skip -eq 0 ]] && filtered_up_nodes+="$n"$'\n'
+        done <<< "$up_nodes"
         
-        if [[ -n "$up_nodes" ]]; then
+        if [[ -n "$filtered_up_nodes" ]]; then
+            # Count nodes to test
+            node_count=$(echo "$filtered_up_nodes" | wc -l)
+            log_info "Found $node_count UP compute node(s) to test"
+            echo ""
+            
+            # Temporarily disable errexit to allow loop to continue on failures
+            set +e
+            
             while IFS= read -r node; do
                 if [[ -n "$node" ]]; then
                     log_info "Testing node: $node"
                     
                     # Test nslcd service on node
-                    if ssh "$node" "systemctl is-active --quiet nslcd 2>/dev/null"; then
+                    ssh -n "$node" "systemctl is-active --quiet nslcd 2>/dev/null" 2>/dev/null
+                    if [[ $? -eq 0 ]]; then
                         log_info "  ✓ nslcd service is running"
                     else
                         log_error "  ✗ nslcd service is not running"
@@ -619,7 +683,8 @@ if [[ "$MODE" == "validate" ]]; then
                     fi
                     
                     # Test getent on node (this uses nslcd with certificate auth)
-                    if ssh "$node" "getent passwd cmsupport >/dev/null 2>&1"; then
+                    ssh -n "$node" "getent passwd cmsupport >/dev/null 2>&1" 2>/dev/null
+                    if [[ $? -eq 0 ]]; then
                         log_info "  ✓ User lookup via nslcd works (certificate-based)"
                     else
                         log_error "  ✗ User lookup via nslcd failed"
@@ -627,14 +692,20 @@ if [[ "$MODE" == "validate" ]]; then
                     fi
                     
                     # Verify nslcd is configured with sasl_mech external
-                    if ssh "$node" "grep -q '^sasl_mech external' /etc/nslcd.conf 2>/dev/null"; then
+                    ssh -n "$node" "grep -q '^sasl_mech external' /etc/nslcd.conf 2>/dev/null" 2>/dev/null
+                    if [[ $? -eq 0 ]]; then
                         log_info "  ✓ nslcd.conf has 'sasl_mech external' configured"
                     else
                         log_error "  ✗ nslcd.conf missing 'sasl_mech external'"
                         VALIDATION_FAILED=1
                     fi
+                    
+                    echo ""
                 fi
-            done <<< "$up_nodes"
+            done <<< "$filtered_up_nodes"
+            
+            # Re-enable errexit
+            set -e
         else
             log_warn "No compute nodes are currently UP - skipping node tests"
         fi
@@ -733,7 +804,7 @@ if [[ "$MODE" == "validate" ]]; then
         echo -e "${GREEN}✓ ALL VALIDATION TESTS PASSED${NC}"
         echo ""
         log_info "LDAP is configured correctly and working as expected:"
-        log_info "  ✓ Certificate-based authentication (SASL EXTERNAL) works on head node"
+        log_info "  ✓ Certificate-based authentication (SASL EXTERNAL) works on all head nodes"
         log_info "  ✓ Bind credentials authentication works"
         log_info "  ✓ nslcd is configured with certificate auth (sasl_mech external) on all UP nodes"
         log_info "  ✓ User lookups work via nslcd/getent on all UP nodes"
@@ -823,20 +894,78 @@ if [[ "$MODE" == "write" ]]; then
     echo ""
     log_info "Step 2: Configuring nslcd.conf on head nodes"
     head_nodes=$(discover_head_nodes)
+    current_hostname=$(hostname -s)
     
     for node in $head_nodes; do
         log_info "Processing head node: $node"
-        
-        if [[ -f "/etc/nslcd.conf" ]]; then
-            update_nslcd_conf "/etc/nslcd.conf"
-            
-            if systemctl list-unit-files | grep -q "^nslcd.service"; then
-                log_info "Restarting nslcd service..."
-                systemctl restart nslcd || log_warn "Failed to restart nslcd service"
-            fi
-        else
-            log_warn "nslcd.conf not found on head node"
-        fi
+
+		if [[ "$node" == "$current_hostname" ]]; then
+			# Local head node: update ldap.conf and nslcd.conf with detailed logs
+			if [[ -f "/etc/openldap/ldap.conf" ]]; then
+				if grep -q "^SASL_MECH external" "/etc/openldap/ldap.conf" 2>/dev/null; then
+					log_info "SASL_MECH external already present in /etc/openldap/ldap.conf"
+				else
+					log_info "Adding 'SASL_MECH external' to /etc/openldap/ldap.conf"
+					update_ldap_conf "/etc/openldap/ldap.conf"
+				fi
+			else
+				log_warn "/etc/openldap/ldap.conf not found on local head node"
+			fi
+			if [[ -f "/etc/nslcd.conf" ]]; then
+				if grep -q "^sasl_mech external" "/etc/nslcd.conf" 2>/dev/null; then
+					log_info "sasl_mech external already present in /etc/nslcd.conf"
+				else
+					log_info "Adding 'sasl_mech external' to /etc/nslcd.conf"
+					update_nslcd_conf "/etc/nslcd.conf"
+				fi
+				if systemctl cat nslcd.service >/dev/null 2>&1; then
+					log_info "Restarting nslcd service on $node..."
+					if systemctl restart nslcd 2>/dev/null; then
+						log_info "✓ nslcd restarted on $node"
+					else
+						log_warn "Failed to restart nslcd service on $node"
+					fi
+				else
+					log_warn "nslcd service not found on $node"
+				fi
+			else
+				log_warn "nslcd.conf not found on local head node"
+			fi
+		else
+			# Remote head node: check and update ldap.conf with logs
+			if ssh -n "$node" "test -f /etc/openldap/ldap.conf" 2>/dev/null; then
+				if ssh -n "$node" "grep -q '^SASL_MECH external' /etc/openldap/ldap.conf" 2>/dev/null; then
+					log_info "SASL_MECH external already present in /etc/openldap/ldap.conf on $node"
+				else
+					log_info "Adding 'SASL_MECH external' to /etc/openldap/ldap.conf on $node"
+					ssh -n "$node" "cp /etc/openldap/ldap.conf /etc/openldap/ldap.conf.backup.\$(date +%Y%m%d_%H%M%S) 2>/dev/null || true; printf '\n# Force external authentication by default (added by bcm_ldap_bind.sh)\nSASL_MECH external\n' >> /etc/openldap/ldap.conf" 2>/dev/null || log_warn "Failed to update /etc/openldap/ldap.conf on $node"
+				fi
+			else
+				log_warn "/etc/openldap/ldap.conf not found on $node"
+			fi
+
+			# Remote head node: check and update nslcd.conf with logs and restart service
+			if ssh -n "$node" "test -f /etc/nslcd.conf" 2>/dev/null; then
+				if ssh -n "$node" "grep -q '^sasl_mech external' /etc/nslcd.conf" 2>/dev/null; then
+					log_info "sasl_mech external already present in /etc/nslcd.conf on $node"
+				else
+					log_info "Adding 'sasl_mech external' to /etc/nslcd.conf on $node"
+					ssh -n "$node" "cp /etc/nslcd.conf /etc/nslcd.conf.backup.\$(date +%Y%m%d_%H%M%S) 2>/dev/null || true; printf '\n# Use certificate as auth (added by bcm_ldap_bind.sh)\nsasl_mech external\n' >> /etc/nslcd.conf" 2>/dev/null || log_warn "Failed to update /etc/nslcd.conf on $node"
+				fi
+				if ssh -n "$node" "systemctl cat nslcd.service >/dev/null 2>&1"; then
+					log_info "Restarting nslcd service on $node..."
+					if ssh -n "$node" "systemctl restart nslcd" 2>/dev/null; then
+						log_info "✓ nslcd restarted on $node"
+					else
+						log_warn "Failed to restart nslcd on $node"
+					fi
+				else
+					log_warn "nslcd service not found on $node"
+				fi
+			else
+				log_warn "nslcd.conf not found on $node"
+			fi
+		fi
     done
     
     # ============================================================================
@@ -887,7 +1016,7 @@ if [[ "$MODE" == "write" ]]; then
             
             log_info "Restarting nslcd service on compute nodes..."
             
-            cmsh -c "device; foreach -t physicalnode -s UP * (exec systemctl restart nslcd || true)" 2>&1 | while read -r line; do
+            cmsh -c "device; foreach -t physicalnode -s UP * (pexec systemctl restart nslcd || true)" 2>&1 | while read -r line; do
                 log_info "  $line"
             done || log_warn "nslcd restart completed with warnings"
             
@@ -906,7 +1035,7 @@ if [[ "$MODE" == "write" ]]; then
     echo ""
     log_info "Step 5: Checking for SSSD configuration"
     
-    if systemctl list-unit-files | grep -q "^sssd.service"; then
+    if systemctl cat sssd.service >/dev/null 2>&1; then
         if systemctl is-active --quiet sssd 2>/dev/null || systemctl is-enabled --quiet sssd 2>/dev/null; then
             sssd_conf="/etc/sssd/sssd.conf"
             
@@ -980,7 +1109,7 @@ if [[ "$MODE" == "write" ]]; then
             fi
         fi
         
-        if systemctl list-unit-files | grep -q "slapd.service"; then
+        if systemctl cat slapd.service >/dev/null 2>&1; then
             log_info "Restarting slapd service..."
             systemctl restart slapd || log_warn "Failed to restart slapd service"
         else
@@ -1007,7 +1136,7 @@ if [[ "$MODE" == "write" ]]; then
     else
         log_info "  ○ Compute node changes will apply on next boot"
     fi
-    if systemctl list-unit-files | grep -q "^sssd.service"; then
+    if systemctl cat sssd.service >/dev/null 2>&1; then
         log_info "  ✓ Updated SSSD configuration (if applicable)"
     fi
     log_info "  ✓ Updated slapd.conf for bind authentication (TLSVerifyClient=try, require authc)"
@@ -1028,6 +1157,573 @@ if [[ "$MODE" == "write" ]]; then
     echo ""
     
     exit 0
+fi
+
+# ============================================================================
+# ROLLBACK MODE - Undo All Changes
+# ============================================================================
+
+if [[ "$MODE" == "rollback" ]]; then
+    # Ensure the script is run as root
+    if [[ $EUID -ne 0 ]]; then
+       log_error "Rollback mode must be run as root."
+       log_error "Please run: sudo $0 --rollback"
+       exit 1
+    fi
+    
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}          ROLLBACK MODE - Undoing Configuration Changes${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    log_warn "This will restore all configuration files from backups and remove"
+    log_warn "changes made by the --write mode."
+    echo ""
+    
+    # Ask for confirmation
+    read -p "Are you sure you want to rollback all changes? (yes/no): " -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+        log_info "Rollback cancelled."
+        exit 0
+    fi
+    
+    log_info "Starting rollback process..."
+    echo ""
+    
+    ROLLBACK_FAILED=0
+    FILES_RESTORED=0
+    
+    # Function to restore a file from backup
+    restore_from_backup() {
+        local conf_file="$1"
+        
+        if [[ ! -f "$conf_file" ]]; then
+            log_warn "File not found: $conf_file - skipping"
+            return 1
+        fi
+        
+        # Find the most recent backup file
+        local backup_file=$(find "$(dirname "$conf_file")" -maxdepth 1 -name "$(basename "$conf_file").backup.*" -type f 2>/dev/null | sort -r | head -n 1)
+        
+        if [[ -n "$backup_file" && -f "$backup_file" ]]; then
+            log_info "Restoring $conf_file from backup: $backup_file"
+            cp "$backup_file" "$conf_file" || {
+                log_error "Failed to restore $conf_file"
+                ROLLBACK_FAILED=1
+                return 1
+            }
+            FILES_RESTORED=$((FILES_RESTORED + 1))
+            return 0
+        else
+            log_warn "No backup found for $conf_file"
+            return 1
+        fi
+    }
+    
+    # Function to remove lines added by the script
+    remove_script_additions() {
+        local conf_file="$1"
+        local marker="$2"
+        
+        if [[ ! -f "$conf_file" ]]; then
+            return 1
+        fi
+        
+        if grep -q "$marker" "$conf_file" 2>/dev/null; then
+            log_info "Removing lines added by script from $conf_file"
+            
+            # Create a safety backup
+            cp "$conf_file" "${conf_file}.pre-rollback.$(date +%Y%m%d_%H%M%S)"
+            
+            # Remove the comment line and the configuration line after it
+            sed -i "/# Force external authentication by default (added by bcm_ldap_bind.sh)/,/^SASL_MECH external/d" "$conf_file" 2>/dev/null || true
+            sed -i "/# Use certificate as auth (added by bcm_ldap_bind.sh)/,/^sasl_mech external/d" "$conf_file" 2>/dev/null || true
+            sed -i "/ldap_sasl_mech = EXTERNAL/d" "$conf_file" 2>/dev/null || true
+            sed -i "/# Require authentication/d" "$conf_file" 2>/dev/null || true
+            sed -i "/^require authc$/d" "$conf_file" 2>/dev/null || true
+            
+            FILES_RESTORED=$((FILES_RESTORED + 1))
+            return 0
+        fi
+        
+        return 1
+    }
+    
+    # ============================================================================
+    # STEP 1: Restore OpenLDAP client configuration on head nodes
+    # ============================================================================
+    echo ""
+    log_info "Step 1: Restoring OpenLDAP client (ldap.conf) on head nodes"
+    
+    if [[ -f "/etc/openldap/ldap.conf" ]]; then
+        if ! restore_from_backup "/etc/openldap/ldap.conf"; then
+            remove_script_additions "/etc/openldap/ldap.conf" "SASL_MECH external"
+        fi
+    fi
+    
+    # ============================================================================
+    # STEP 2: Restore nslcd configuration on head nodes
+    # ============================================================================
+    echo ""
+    log_info "Step 2: Restoring nslcd.conf on head nodes"
+    head_nodes=$(discover_head_nodes)
+    
+    for node in $head_nodes; do
+        log_info "Processing head node: $node"
+        
+        if [[ -f "/etc/nslcd.conf" ]]; then
+            if ! restore_from_backup "/etc/nslcd.conf"; then
+                remove_script_additions "/etc/nslcd.conf" "sasl_mech external"
+            fi
+            
+            if systemctl cat nslcd.service >/dev/null 2>&1; then
+                log_info "Restarting nslcd service..."
+                systemctl restart nslcd || log_warn "Failed to restart nslcd service"
+            fi
+        fi
+    done
+    
+    # ============================================================================
+    # STEP 3: Restore software images
+    # ============================================================================
+    echo ""
+    log_info "Step 3: Restoring OpenLDAP and nslcd in software images"
+    image_paths=$(get_software_image_paths)
+    
+    if [[ -n "$image_paths" ]]; then
+        while IFS= read -r image_path; do
+            if [[ -n "$image_path" ]]; then
+                log_info "Processing software image: $image_path"
+                
+                image_ldap_conf="${image_path}/etc/openldap/ldap.conf"
+                if ! restore_from_backup "$image_ldap_conf"; then
+                    remove_script_additions "$image_ldap_conf" "SASL_MECH external"
+                fi
+                
+                image_nslcd_conf="${image_path}/etc/nslcd.conf"
+                if ! restore_from_backup "$image_nslcd_conf"; then
+                    remove_script_additions "$image_nslcd_conf" "sasl_mech external"
+                fi
+            fi
+        done <<< "$image_paths"
+    fi
+    
+    # ============================================================================
+    # STEP 4: Push changes to running compute nodes
+    # ============================================================================
+    echo ""
+    log_info "Step 4: Pushing restored configuration to running compute nodes"
+    
+    compute_nodes=$(cmsh -c "device list" | awk '$1 != "HeadNode" && NF >= 2 { print $2 }')
+    
+    if [[ -n "$compute_nodes" ]]; then
+        up_nodes=$(cmsh -c "device status" | grep -E "\[\s*UP\s*\]" | awk '{print $1}' | grep -v "HeadNode")
+        
+        if [[ -n "$up_nodes" ]]; then
+            up_count=$(echo "$up_nodes" | wc -w)
+            log_info "Updating filesystem on $up_count running compute node(s) with imageupdate..."
+            log_info "This may take several minutes..."
+            
+            cmsh -c "device; imageupdate -t physicalnode -s UP -w --wait" 2>&1 | while read -r line; do
+                log_info "  $line"
+            done || log_warn "imageupdate completed with warnings"
+            
+            log_info "Restarting nslcd service on compute nodes..."
+            
+            cmsh -c "device; foreach -t physicalnode -s UP * (pexec systemctl restart nslcd || true)" 2>&1 | while read -r line; do
+                log_info "  $line"
+            done || log_warn "nslcd restart completed with warnings"
+            
+            log_info "✓ Compute nodes updated successfully"
+        else
+            log_info "No compute nodes currently UP - skipping imageupdate"
+            log_info "Changes will be applied when nodes are rebooted or powered on"
+        fi
+    fi
+    
+    # ============================================================================
+    # STEP 5: Restore SSSD configuration if present
+    # ============================================================================
+    echo ""
+    log_info "Step 5: Restoring SSSD configuration"
+    
+    sssd_conf="/etc/sssd/sssd.conf"
+    
+    if systemctl cat sssd.service >/dev/null 2>&1; then
+        if systemctl is-active --quiet sssd 2>/dev/null || systemctl is-enabled --quiet sssd 2>/dev/null; then
+            if [[ -f "$sssd_conf" ]]; then
+                log_info "SSSD detected, restoring configuration..."
+                
+                if ! restore_from_backup "$sssd_conf"; then
+                    # Remove ldap_sasl_mech line if no backup exists
+                    if grep -q "ldap_sasl_mech = EXTERNAL" "$sssd_conf"; then
+                        log_info "Removing ldap_sasl_mech from $sssd_conf"
+                        cp "$sssd_conf" "${sssd_conf}.pre-rollback.$(date +%Y%m%d_%H%M%S)"
+                        sed -i '/^[[:space:]]*ldap_sasl_mech[[:space:]]*=[[:space:]]*EXTERNAL/d' "$sssd_conf"
+                        FILES_RESTORED=$((FILES_RESTORED + 1))
+                    fi
+                fi
+                
+                log_info "Restarting sssd service..."
+                systemctl restart sssd || log_warn "Failed to restart sssd service"
+            fi
+        fi
+    fi
+    
+    # ============================================================================
+    # STEP 6: Restore slapd configuration
+    # ============================================================================
+    echo ""
+    log_info "Step 6: Restoring slapd.conf"
+    
+    slapd_conf="/cm/local/apps/openldap/etc/slapd.conf"
+    
+    if [[ -f "$slapd_conf" ]]; then
+        log_info "Restoring slapd.conf..."
+        
+        if ! restore_from_backup "$slapd_conf"; then
+            # If no backup, try to undo the changes manually
+            log_info "No backup found, attempting manual removal of changes..."
+            
+            if grep -q "^TLSVerifyClient try" "$slapd_conf" || grep -q "^require authc" "$slapd_conf"; then
+                cp "$slapd_conf" "${slapd_conf}.pre-rollback.$(date +%Y%m%d_%H%M%S)"
+                
+                # This is tricky - we don't know the original TLSVerifyClient value
+                # Best we can do is comment it out or remove it if we added it
+                log_warn "Cannot determine original TLSVerifyClient value"
+                log_warn "You may need to manually verify slapd.conf settings"
+                
+                # Remove require authc if present
+                sed -i '/^require authc$/d' "$slapd_conf" 2>/dev/null || true
+                sed -i '/# Require authentication/d' "$slapd_conf" 2>/dev/null || true
+                
+                FILES_RESTORED=$((FILES_RESTORED + 1))
+            fi
+        fi
+        
+        if systemctl cat slapd.service >/dev/null 2>&1; then
+            log_info "Restarting slapd service..."
+            systemctl restart slapd || log_warn "Failed to restart slapd service"
+        fi
+    fi
+    
+    # ============================================================================
+    # SUMMARY
+    # ============================================================================
+    echo ""
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}                   Rollback Summary${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    if [[ $ROLLBACK_FAILED -eq 0 ]]; then
+        echo -e "${GREEN}✓ ROLLBACK COMPLETED SUCCESSFULLY${NC}"
+        echo ""
+        log_info "Summary:"
+        log_info "  ✓ Restored $FILES_RESTORED configuration file(s)"
+        log_info "  ✓ Restarted affected services (nslcd, sssd, slapd)"
+        if [[ -n "$up_nodes" ]]; then
+            log_info "  ✓ Pushed changes to running compute nodes"
+        fi
+        echo ""
+        log_info "Backup files created during this rollback:"
+        log_info "  Find them with: find /etc /cm -name '*.pre-rollback.*' -type f 2>/dev/null"
+        echo ""
+        log_info "Original backup files from --write mode are still available:"
+        log_info "  Find them with: find /etc /cm -name '*.backup.*' -type f 2>/dev/null"
+        echo ""
+        log_info "Next steps:"
+        log_info "  1. Verify services are running: systemctl status nslcd slapd"
+        log_info "  2. Test LDAP authentication is working as expected"
+        log_info "  3. Monitor logs for any issues: journalctl -u nslcd -u slapd -f"
+        echo ""
+    else
+        echo -e "${RED}✗ ROLLBACK COMPLETED WITH WARNINGS${NC}"
+        echo ""
+        log_warn "Rollback completed but some issues were encountered."
+        log_warn "Please review the messages above and verify your configuration."
+        log_warn "You may need to manually check and fix some configuration files."
+        echo ""
+        exit 1
+    fi
+    
+    exit 0
+fi
+
+# ============================================================================
+# ROLLBACK-VALIDATE MODE - Verify System is in Original State
+# ============================================================================
+
+if [[ "$MODE" == "rollback-validate" ]]; then
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}    ROLLBACK-VALIDATE MODE - Verifying Original State${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    log_info "Validating that system is in original state (before --write changes)..."
+    echo ""
+    
+    VALIDATION_FAILED=0
+    
+    # Function to check if a file has script-added configurations
+    check_file_not_modified() {
+        local conf_file="$1"
+        local marker="$2"
+        local description="$3"
+        
+        if [[ ! -f "$conf_file" ]]; then
+            log_warn "File not found: $conf_file (skipping)"
+            return 0
+        fi
+        
+        if grep -q "$marker" "$conf_file" 2>/dev/null; then
+            log_error "✗ $conf_file still has script-added configuration"
+            log_error "  Found: $marker"
+            VALIDATION_FAILED=1
+            return 1
+        else
+            log_info "✓ $conf_file is in original state (no script modifications)"
+            return 0
+        fi
+    }
+    
+    # ============================================================================
+    # TEST 1: Verify Head Node Configuration Files
+    # ============================================================================
+    log_info "Test 1: Verifying head node configuration files"
+    echo ""
+    
+    # Check /etc/openldap/ldap.conf
+    if [[ -f "/etc/openldap/ldap.conf" ]]; then
+        check_file_not_modified "/etc/openldap/ldap.conf" \
+            "# Force external authentication by default (added by bcm_ldap_bind.sh)" \
+            "OpenLDAP client config"
+        
+        # Also check for the actual configuration line
+        if grep -q "^SASL_MECH external" "/etc/openldap/ldap.conf" 2>/dev/null; then
+            # Check if it has our comment above it
+            if grep -B1 "^SASL_MECH external" "/etc/openldap/ldap.conf" | grep -q "added by bcm_ldap_bind.sh"; then
+                log_error "✗ /etc/openldap/ldap.conf has script-added 'SASL_MECH external'"
+                VALIDATION_FAILED=1
+            else
+                log_info "✓ /etc/openldap/ldap.conf has 'SASL_MECH external' but not from script"
+            fi
+        fi
+    fi
+    
+    # Check /etc/nslcd.conf
+    if [[ -f "/etc/nslcd.conf" ]]; then
+        check_file_not_modified "/etc/nslcd.conf" \
+            "# Use certificate as auth (added by bcm_ldap_bind.sh)" \
+            "nslcd config"
+        
+        # Also check for the actual configuration line
+        if grep -q "^sasl_mech external" "/etc/nslcd.conf" 2>/dev/null; then
+            # Check if it has our comment above it
+            if grep -B1 "^sasl_mech external" "/etc/nslcd.conf" | grep -q "added by bcm_ldap_bind.sh"; then
+                log_error "✗ /etc/nslcd.conf has script-added 'sasl_mech external'"
+                VALIDATION_FAILED=1
+            else
+                log_info "✓ /etc/nslcd.conf has 'sasl_mech external' but not from script"
+            fi
+        fi
+    fi
+    
+    # Check /etc/sssd/sssd.conf if SSSD is present
+    if systemctl cat sssd.service >/dev/null 2>&1; then
+        if [[ -f "/etc/sssd/sssd.conf" ]]; then
+            if grep -q "^[[:space:]]*ldap_sasl_mech[[:space:]]*=[[:space:]]*EXTERNAL" "/etc/sssd/sssd.conf" 2>/dev/null; then
+                log_error "✗ /etc/sssd/sssd.conf has 'ldap_sasl_mech = EXTERNAL'"
+                log_error "  This was likely added by the script"
+                VALIDATION_FAILED=1
+            else
+                log_info "✓ /etc/sssd/sssd.conf is in original state"
+            fi
+        fi
+    fi
+    
+    # ============================================================================
+    # TEST 2: Verify Software Image Configuration Files
+    # ============================================================================
+    echo ""
+    log_info "Test 2: Verifying software image configuration files"
+    echo ""
+    
+    image_paths=$(get_software_image_paths)
+    
+    if [[ -n "$image_paths" ]]; then
+        while IFS= read -r image_path; do
+            if [[ -n "$image_path" ]]; then
+                log_info "Checking software image: $image_path"
+                
+                # Check ldap.conf in image
+                image_ldap_conf="${image_path}/etc/openldap/ldap.conf"
+                if [[ -f "$image_ldap_conf" ]]; then
+                    if grep -q "# Force external authentication by default (added by bcm_ldap_bind.sh)" "$image_ldap_conf" 2>/dev/null; then
+                        log_error "  ✗ ldap.conf has script-added configuration"
+                        VALIDATION_FAILED=1
+                    else
+                        log_info "  ✓ ldap.conf is in original state"
+                    fi
+                fi
+                
+                # Check nslcd.conf in image
+                image_nslcd_conf="${image_path}/etc/nslcd.conf"
+                if [[ -f "$image_nslcd_conf" ]]; then
+                    if grep -q "# Use certificate as auth (added by bcm_ldap_bind.sh)" "$image_nslcd_conf" 2>/dev/null; then
+                        log_error "  ✗ nslcd.conf has script-added configuration"
+                        VALIDATION_FAILED=1
+                    else
+                        log_info "  ✓ nslcd.conf is in original state"
+                    fi
+                fi
+            fi
+        done <<< "$image_paths"
+    else
+        log_info "No software images found"
+    fi
+    
+    # ============================================================================
+    # TEST 3: Verify Compute Node Configuration (if UP)
+    # ============================================================================
+    echo ""
+    log_info "Test 3: Verifying compute node configuration files"
+    echo ""
+    
+    compute_nodes=$(cmsh -c "device list" | awk '$1 != "HeadNode" && NF >= 2 { print $2 }')
+    
+    if [[ -n "$compute_nodes" ]]; then
+        up_nodes=$(cmsh -c "device status" | grep -E "\[\s*UP\s*\]" | awk '{print $1}' | grep -v "HeadNode")
+        
+        if [[ -n "$up_nodes" ]]; then
+            while IFS= read -r node; do
+                if [[ -n "$node" ]]; then
+                    log_info "Testing node: $node"
+                    
+                    # Check nslcd.conf on compute node
+                    if ssh -n "$node" "test -f /etc/nslcd.conf" 2>/dev/null; then
+                        if ssh -n "$node" "grep -q '# Use certificate as auth (added by bcm_ldap_bind.sh)' /etc/nslcd.conf 2>/dev/null"; then
+                            log_error "  ✗ nslcd.conf has script-added configuration"
+                            VALIDATION_FAILED=1
+                        else
+                            log_info "  ✓ nslcd.conf is in original state"
+                        fi
+                    fi
+                    
+                    # Check ldap.conf on compute node
+                    if ssh -n "$node" "test -f /etc/openldap/ldap.conf" 2>/dev/null; then
+                        if ssh -n "$node" "grep -q '# Force external authentication by default (added by bcm_ldap_bind.sh)' /etc/openldap/ldap.conf 2>/dev/null"; then
+                            log_error "  ✗ ldap.conf has script-added configuration"
+                            VALIDATION_FAILED=1
+                        else
+                            log_info "  ✓ ldap.conf is in original state"
+                        fi
+                    fi
+                fi
+            done <<< "$up_nodes"
+        else
+            log_warn "No compute nodes are currently UP - skipping node checks"
+        fi
+    else
+        log_info "No compute nodes found in cluster"
+    fi
+    
+    # ============================================================================
+    # TEST 4: Verify slapd.conf Configuration
+    # ============================================================================
+    echo ""
+    log_info "Test 4: Verifying slapd.conf configuration"
+    echo ""
+    
+    slapd_conf="/cm/local/apps/openldap/etc/slapd.conf"
+    
+    if [[ -f "$slapd_conf" ]]; then
+        # Check for 'require authc' with our comment
+        if grep -q "^require authc" "$slapd_conf" 2>/dev/null; then
+            # Check if it has our comment above it
+            if grep -B1 "^require authc" "$slapd_conf" | grep -q "# Require authentication"; then
+                log_error "✗ slapd.conf has script-added 'require authc'"
+                VALIDATION_FAILED=1
+            else
+                log_info "✓ slapd.conf has 'require authc' but not from script"
+            fi
+        else
+            log_info "✓ slapd.conf does not have 'require authc'"
+        fi
+        
+        # For TLSVerifyClient, we can't easily tell if we modified it
+        # Just report its current value
+        if grep -q "^TLSVerifyClient" "$slapd_conf" 2>/dev/null; then
+            current_value=$(grep "^TLSVerifyClient" "$slapd_conf" | awk '{print $2}')
+            if [[ "$current_value" == "try" ]]; then
+                log_warn "⚠ slapd.conf has 'TLSVerifyClient try' (may be from script)"
+                log_warn "  Cannot definitively determine if this was the original value"
+            else
+                log_info "✓ slapd.conf has TLSVerifyClient = $current_value (not 'try')"
+            fi
+        else
+            log_info "✓ slapd.conf does not have TLSVerifyClient directive"
+        fi
+    else
+        log_warn "slapd.conf not found at $slapd_conf"
+    fi
+    
+    # ============================================================================
+    # TEST 5: Check for Backup Files
+    # ============================================================================
+    echo ""
+    log_info "Test 5: Checking for backup files (indicates --write was run)"
+    echo ""
+    
+    backup_files=$(find /etc /cm -name '*.backup.*' -type f 2>/dev/null | head -n 10)
+    
+    if [[ -n "$backup_files" ]]; then
+        backup_count=$(find /etc /cm -name '*.backup.*' -type f 2>/dev/null | wc -l)
+        log_warn "⚠ Found $backup_count backup file(s) from --write mode:"
+        echo "$backup_files" | while read -r backup; do
+            log_warn "  - $backup"
+        done
+        log_warn "This suggests --write was run but --rollback may not have been"
+    else
+        log_info "✓ No backup files found (--write was never run, or backups were cleaned up)"
+    fi
+    
+    # ============================================================================
+    # SUMMARY
+    # ============================================================================
+    echo ""
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}              Rollback-Validation Summary${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    if [[ $VALIDATION_FAILED -eq 0 ]]; then
+        echo -e "${GREEN}✓ SYSTEM IS IN ORIGINAL STATE${NC}"
+        echo ""
+        log_info "All validation checks passed:"
+        log_info "  ✓ Configuration files do not have script-added modifications"
+        log_info "  ✓ Software images are in original state"
+        log_info "  ✓ Compute nodes (if checked) are in original state"
+        log_info "  ✓ slapd.conf appears to be in original state"
+        echo ""
+        log_info "This indicates either:"
+        log_info "  1. The --write mode was never run, OR"
+        log_info "  2. The --rollback mode was successfully executed"
+        echo ""
+        exit 0
+    else
+        echo -e "${RED}✗ SYSTEM IS NOT IN ORIGINAL STATE${NC}"
+        echo ""
+        log_error "System has modifications from --write mode:"
+        log_error "  • Configuration files still have script-added settings"
+        log_error "  • The system has NOT been successfully rolled back"
+        echo ""
+        log_info "To restore the original state, run:"
+        log_info "  ${GREEN}sudo $0 --rollback${NC}"
+        echo ""
+        exit 1
+    fi
 fi
 
 # Should never reach here
