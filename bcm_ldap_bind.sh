@@ -171,8 +171,13 @@ update_ldap_conf() {
         return 0
     else
         log_info "Adding 'SASL_MECH external' to $actual_file"
-        # Create backup
-        cp "$actual_file" "${actual_file}.backup.$(date +%Y%m%d_%H%M%S)"
+        # Create backup only if one doesn't exist (preserve original state)
+        if ! ls "${actual_file}.backup."* 1> /dev/null 2>&1; then
+            cp "$actual_file" "${actual_file}.backup.$(date +%Y%m%d_%H%M%S)"
+            log_info "  Created backup of original file"
+        else
+            log_info "  Backup already exists, preserving original"
+        fi
         # Add configuration
         echo "" >> "$actual_file"
         echo "# Force external authentication by default (added by bcm_ldap_bind.sh)" >> "$actual_file"
@@ -195,8 +200,13 @@ update_nslcd_conf() {
         return 0
     else
         log_info "Adding 'sasl_mech external' to $conf_file"
-        # Create backup
-        cp "$conf_file" "${conf_file}.backup.$(date +%Y%m%d_%H%M%S)"
+        # Create backup only if one doesn't exist (preserve original state)
+        if ! ls "${conf_file}.backup."* 1> /dev/null 2>&1; then
+            cp "$conf_file" "${conf_file}.backup.$(date +%Y%m%d_%H%M%S)"
+            log_info "  Created backup of original file"
+        else
+            log_info "  Backup already exists, preserving original"
+        fi
         # Add configuration
         echo "" >> "$conf_file"
         echo "# Use certificate as auth (added by bcm_ldap_bind.sh)" >> "$conf_file"
@@ -1108,7 +1118,13 @@ if [[ "$MODE" == "write" ]]; then
             if [[ -f "$slapd_conf" ]]; then
                 log_info "Found slapd.conf, updating configuration..."
                 
-                cp "$slapd_conf" "${slapd_conf}.backup.$(date +%Y%m%d_%H%M%S)"
+                # Create backup only if one doesn't exist (preserve original state)
+                if ! ls "${slapd_conf}.backup."* 1> /dev/null 2>&1; then
+                    cp "$slapd_conf" "${slapd_conf}.backup.$(date +%Y%m%d_%H%M%S)"
+                    log_info "  Created backup of original file"
+                else
+                    log_info "  Backup already exists, preserving original"
+                fi
                 
                 if grep -q "^TLSVerifyClient" "$slapd_conf"; then
                     if grep -q "^TLSVerifyClient try" "$slapd_conf"; then
@@ -1153,8 +1169,12 @@ if [[ "$MODE" == "write" ]]; then
             if ssh -n "$node" "test -f $slapd_conf" 2>/dev/null; then
                 log_info "Found slapd.conf on $node, updating configuration..."
                 
-                # Create backup on remote node
-                ssh -n "$node" "cp $slapd_conf ${slapd_conf}.backup.\$(date +%Y%m%d_%H%M%S)" 2>/dev/null || log_warn "Failed to create backup on $node"
+                # Create backup only if one doesn't exist (preserve original state)
+                if ! ssh -n "$node" "ls ${slapd_conf}.backup.* 1> /dev/null 2>&1" 2>/dev/null; then
+                    ssh -n "$node" "cp $slapd_conf ${slapd_conf}.backup.\$(date +%Y%m%d_%H%M%S)" 2>/dev/null && log_info "  Created backup of original file on $node" || log_warn "Failed to create backup on $node"
+                else
+                    log_info "  Backup already exists on $node, preserving original"
+                fi
                 
                 # Check and update TLSVerifyClient
                 if ssh -n "$node" "grep -q '^TLSVerifyClient' $slapd_conf" 2>/dev/null; then
@@ -1311,8 +1331,8 @@ if [[ "$MODE" == "rollback" ]]; then
             return 1
         fi
         
-        # Find the most recent backup file
-        local backup_file=$(find "$(dirname "$actual_file")" -maxdepth 1 -name "$(basename "$actual_file").backup.*" -type f 2>/dev/null | sort -r | head -n 1)
+        # Find the backup file (should only be one - the original state)
+        local backup_file=$(find "$(dirname "$actual_file")" -maxdepth 1 -name "$(basename "$actual_file").backup.*" -type f 2>/dev/null | head -n 1)
         
         if [[ -n "$backup_file" && -f "$backup_file" ]]; then
             log_info "Restoring $actual_file from backup: $backup_file"
@@ -1404,8 +1424,8 @@ if [[ "$MODE" == "rollback" ]]; then
             if ssh -n "$node" "test -f /etc/openldap/ldap.conf" 2>/dev/null; then
                 log_info "Restoring ldap.conf on $node..."
                 
-                # Try to find and restore from backup on remote node
-                backup_file=$(ssh -n "$node" "find /etc/openldap -maxdepth 1 -name 'ldap.conf.backup.*' -type f 2>/dev/null | sort -r | head -n 1" 2>/dev/null)
+                # Try to find and restore from backup on remote node (should only be one - original state)
+                backup_file=$(ssh -n "$node" "find /etc/openldap -maxdepth 1 -name 'ldap.conf.backup.*' -type f 2>/dev/null | head -n 1" 2>/dev/null)
                 
                 if [[ -n "$backup_file" ]]; then
                     log_info "Restoring from backup: $backup_file"
@@ -1445,8 +1465,8 @@ if [[ "$MODE" == "rollback" ]]; then
             if ssh -n "$node" "test -f /etc/nslcd.conf" 2>/dev/null; then
                 log_info "Restoring nslcd.conf on $node..."
                 
-                # Try to find and restore from backup on remote node
-                backup_file=$(ssh -n "$node" "find /etc -maxdepth 1 -name 'nslcd.conf.backup.*' -type f 2>/dev/null | sort -r | head -n 1" 2>/dev/null)
+                # Try to find and restore from backup on remote node (should only be one - original state)
+                backup_file=$(ssh -n "$node" "find /etc -maxdepth 1 -name 'nslcd.conf.backup.*' -type f 2>/dev/null | head -n 1" 2>/dev/null)
                 
                 if [[ -n "$backup_file" ]]; then
                     log_info "Restoring from backup: $backup_file"
@@ -1601,8 +1621,8 @@ if [[ "$MODE" == "rollback" ]]; then
             if ssh -n "$node" "test -f $slapd_conf" 2>/dev/null; then
                 log_info "Restoring slapd.conf on $node..."
                 
-                # Try to find and restore from backup on remote node
-                backup_file=$(ssh -n "$node" "find $(dirname "$slapd_conf") -maxdepth 1 -name '$(basename "$slapd_conf").backup.*' -type f 2>/dev/null | sort -r | head -n 1" 2>/dev/null)
+                # Try to find and restore from backup on remote node (should only be one - original state)
+                backup_file=$(ssh -n "$node" "find $(dirname "$slapd_conf") -maxdepth 1 -name '$(basename "$slapd_conf").backup.*' -type f 2>/dev/null | head -n 1" 2>/dev/null)
                 
                 if [[ -n "$backup_file" ]]; then
                     log_info "Restoring $slapd_conf from backup on $node: $backup_file"
@@ -1736,44 +1756,74 @@ if [[ "$MODE" == "rollback-validate" ]]; then
     # ============================================================================
     # TEST 1: Verify Head Node Configuration Files
     # ============================================================================
-    log_info "Test 1: Verifying head node configuration files"
+    log_info "Test 1: Verifying head node configuration files on all head nodes"
     echo ""
     
-    # Check /etc/openldap/ldap.conf
-    if [[ -f "/etc/openldap/ldap.conf" ]]; then
-        check_file_not_modified "/etc/openldap/ldap.conf" \
-            "# Force external authentication by default (added by bcm_ldap_bind.sh)" \
-            "OpenLDAP client config"
-        
-        # Also check for the actual configuration line
-        if grep -q "^SASL_MECH external" "/etc/openldap/ldap.conf" 2>/dev/null; then
-            # Check if it has our comment above it
-            if grep -B1 "^SASL_MECH external" "/etc/openldap/ldap.conf" | grep -q "added by bcm_ldap_bind.sh"; then
-                log_error "✗ /etc/openldap/ldap.conf has script-added 'SASL_MECH external'"
-                VALIDATION_FAILED=1
-            else
-                log_info "✓ /etc/openldap/ldap.conf has 'SASL_MECH external' but not from script"
-            fi
-        fi
-    fi
+    head_nodes=$(discover_head_nodes)
+    current_hostname=$(hostname -s)
     
-    # Check /etc/nslcd.conf
-    if [[ -f "/etc/nslcd.conf" ]]; then
-        check_file_not_modified "/etc/nslcd.conf" \
-            "# Use certificate as auth (added by bcm_ldap_bind.sh)" \
-            "nslcd config"
+    for node in $head_nodes; do
+        log_info "Checking head node: $node"
         
-        # Also check for the actual configuration line
-        if grep -q "^sasl_mech external" "/etc/nslcd.conf" 2>/dev/null; then
-            # Check if it has our comment above it
-            if grep -B1 "^sasl_mech external" "/etc/nslcd.conf" | grep -q "added by bcm_ldap_bind.sh"; then
-                log_error "✗ /etc/nslcd.conf has script-added 'sasl_mech external'"
-                VALIDATION_FAILED=1
-            else
-                log_info "✓ /etc/nslcd.conf has 'sasl_mech external' but not from script"
+        if [[ "$node" == "$current_hostname" ]]; then
+            # Local head node
+            # Check /etc/openldap/ldap.conf
+            if [[ -f "/etc/openldap/ldap.conf" ]]; then
+                check_file_not_modified "/etc/openldap/ldap.conf" \
+                    "# Force external authentication by default (added by bcm_ldap_bind.sh)" \
+                    "OpenLDAP client config"
+                
+                # Also check for the actual configuration line
+                if grep -q "^SASL_MECH external" "/etc/openldap/ldap.conf" 2>/dev/null; then
+                    # Check if it has our comment above it
+                    if grep -B1 "^SASL_MECH external" "/etc/openldap/ldap.conf" | grep -q "added by bcm_ldap_bind.sh"; then
+                        log_error "✗ /etc/openldap/ldap.conf has script-added 'SASL_MECH external'"
+                        VALIDATION_FAILED=1
+                    else
+                        log_info "✓ /etc/openldap/ldap.conf has 'SASL_MECH external' but not from script"
+                    fi
+                fi
+            fi
+            
+            # Check /etc/nslcd.conf
+            if [[ -f "/etc/nslcd.conf" ]]; then
+                check_file_not_modified "/etc/nslcd.conf" \
+                    "# Use certificate as auth (added by bcm_ldap_bind.sh)" \
+                    "nslcd config"
+                
+                # Also check for the actual configuration line
+                if grep -q "^sasl_mech external" "/etc/nslcd.conf" 2>/dev/null; then
+                    # Check if it has our comment above it
+                    if grep -B1 "^sasl_mech external" "/etc/nslcd.conf" | grep -q "added by bcm_ldap_bind.sh"; then
+                        log_error "✗ /etc/nslcd.conf has script-added 'sasl_mech external'"
+                        VALIDATION_FAILED=1
+                    else
+                        log_info "✓ /etc/nslcd.conf has 'sasl_mech external' but not from script"
+                    fi
+                fi
+            fi
+        else
+            # Remote head node - check via SSH
+            if ssh -n "$node" "test -f /etc/openldap/ldap.conf" 2>/dev/null; then
+                if ssh -n "$node" "grep -q '# Force external authentication by default (added by bcm_ldap_bind.sh)' /etc/openldap/ldap.conf" 2>/dev/null; then
+                    log_error "✗ /etc/openldap/ldap.conf on $node has script-added configuration"
+                    VALIDATION_FAILED=1
+                else
+                    log_info "✓ /etc/openldap/ldap.conf on $node is in original state"
+                fi
+            fi
+            
+            if ssh -n "$node" "test -f /etc/nslcd.conf" 2>/dev/null; then
+                if ssh -n "$node" "grep -q '# Use certificate as auth (added by bcm_ldap_bind.sh)' /etc/nslcd.conf" 2>/dev/null; then
+                    log_error "✗ /etc/nslcd.conf on $node has script-added configuration"
+                    VALIDATION_FAILED=1
+                else
+                    log_info "✓ /etc/nslcd.conf on $node is in original state"
+                fi
             fi
         fi
-    fi
+        echo ""
+    done
     
     # Check /etc/sssd/sssd.conf if SSSD is present
     if systemctl cat sssd.service >/dev/null 2>&1; then
@@ -1875,44 +1925,83 @@ if [[ "$MODE" == "rollback-validate" ]]; then
     fi
     
     # ============================================================================
-    # TEST 4: Verify slapd.conf Configuration
+    # TEST 4: Verify slapd.conf Configuration on all head nodes
     # ============================================================================
     echo ""
-    log_info "Test 4: Verifying slapd.conf configuration"
+    log_info "Test 4: Verifying slapd.conf configuration on all head nodes"
     echo ""
     
     slapd_conf="/cm/local/apps/openldap/etc/slapd.conf"
     
-    if [[ -f "$slapd_conf" ]]; then
-        # Check for 'require authc' with our comment
-        if grep -q "^require authc" "$slapd_conf" 2>/dev/null; then
-            # Check if it has our comment above it
-            if grep -B1 "^require authc" "$slapd_conf" | grep -q "# Require authentication"; then
-                log_error "✗ slapd.conf has script-added 'require authc'"
-                VALIDATION_FAILED=1
-            else
-                log_info "✓ slapd.conf has 'require authc' but not from script"
-            fi
-        else
-            log_info "✓ slapd.conf does not have 'require authc'"
-        fi
+    for node in $head_nodes; do
+        log_info "Checking slapd.conf on head node: $node"
         
-        # For TLSVerifyClient, we can't easily tell if we modified it
-        # Just report its current value
-        if grep -q "^TLSVerifyClient" "$slapd_conf" 2>/dev/null; then
-            current_value=$(grep "^TLSVerifyClient" "$slapd_conf" | awk '{print $2}')
-            if [[ "$current_value" == "try" ]]; then
-                log_warn "⚠ slapd.conf has 'TLSVerifyClient try' (may be from script)"
-                log_warn "  Cannot definitively determine if this was the original value"
+        if [[ "$node" == "$current_hostname" ]]; then
+            # Local head node
+            if [[ -f "$slapd_conf" ]]; then
+                # Check for 'require authc' with our comment
+                if grep -q "^require authc" "$slapd_conf" 2>/dev/null; then
+                    # Check if it has our comment above it
+                    if grep -B1 "^require authc" "$slapd_conf" | grep -q "# Require authentication"; then
+                        log_error "✗ slapd.conf has script-added 'require authc'"
+                        VALIDATION_FAILED=1
+                    else
+                        log_info "✓ slapd.conf has 'require authc' but not from script"
+                    fi
+                else
+                    log_info "✓ slapd.conf does not have 'require authc'"
+                fi
+                
+                # For TLSVerifyClient, we can't easily tell if we modified it
+                # Just report its current value
+                if grep -q "^TLSVerifyClient" "$slapd_conf" 2>/dev/null; then
+                    current_value=$(grep "^TLSVerifyClient" "$slapd_conf" | awk '{print $2}')
+                    if [[ "$current_value" == "try" ]]; then
+                        log_warn "⚠ slapd.conf has 'TLSVerifyClient try' (may be from script)"
+                        log_warn "  Cannot definitively determine if this was the original value"
+                    else
+                        log_info "✓ slapd.conf has TLSVerifyClient = $current_value (not 'try')"
+                    fi
+                else
+                    log_info "✓ slapd.conf does not have TLSVerifyClient directive"
+                fi
             else
-                log_info "✓ slapd.conf has TLSVerifyClient = $current_value (not 'try')"
+                log_warn "slapd.conf not found at $slapd_conf"
             fi
         else
-            log_info "✓ slapd.conf does not have TLSVerifyClient directive"
+            # Remote head node - check via SSH
+            if ssh -n "$node" "test -f $slapd_conf" 2>/dev/null; then
+                # Check for 'require authc' with our comment
+                if ssh -n "$node" "grep -q '^require authc' $slapd_conf" 2>/dev/null; then
+                    # Check if it has our comment above it
+                    if ssh -n "$node" "grep -B1 '^require authc' $slapd_conf | grep -q '# Require authentication'" 2>/dev/null; then
+                        log_error "✗ slapd.conf on $node has script-added 'require authc'"
+                        VALIDATION_FAILED=1
+                    else
+                        log_info "✓ slapd.conf on $node has 'require authc' but not from script"
+                    fi
+                else
+                    log_info "✓ slapd.conf on $node does not have 'require authc'"
+                fi
+                
+                # Check TLSVerifyClient
+                if ssh -n "$node" "grep -q '^TLSVerifyClient' $slapd_conf" 2>/dev/null; then
+                    current_value=$(ssh -n "$node" "grep '^TLSVerifyClient' $slapd_conf | awk '{print \$2}'" 2>/dev/null)
+                    if [[ "$current_value" == "try" ]]; then
+                        log_warn "⚠ slapd.conf on $node has 'TLSVerifyClient try' (may be from script)"
+                        log_warn "  Cannot definitively determine if this was the original value"
+                    else
+                        log_info "✓ slapd.conf on $node has TLSVerifyClient = $current_value (not 'try')"
+                    fi
+                else
+                    log_info "✓ slapd.conf on $node does not have TLSVerifyClient directive"
+                fi
+            else
+                log_warn "slapd.conf not found on $node"
+            fi
         fi
-    else
-        log_warn "slapd.conf not found at $slapd_conf"
-    fi
+        echo ""
+    done
     
     # ============================================================================
     # TEST 5: Check for Backup Files
