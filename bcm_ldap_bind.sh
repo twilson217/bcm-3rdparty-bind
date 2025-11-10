@@ -914,91 +914,85 @@ if [[ "$MODE" == "write" ]]; then
     # ============================================================================
     echo ""
     log_info "Step 1: Configuring OpenLDAP client (ldap.conf) on head nodes"
+    head_nodes=$(discover_head_nodes)
+    current_hostname=$(hostname -s)
     
-    if [[ -f "/etc/openldap/ldap.conf" ]]; then
-        update_ldap_conf "/etc/openldap/ldap.conf"
-    else
-        log_warn "/etc/openldap/ldap.conf not found on head node"
-    fi
+    for node in $head_nodes; do
+        log_info "Processing head node: $node"
+        
+        if [[ "$node" == "$current_hostname" ]]; then
+            # Local head node
+            if [[ -f "/etc/openldap/ldap.conf" ]]; then
+                update_ldap_conf "/etc/openldap/ldap.conf"
+            else
+                log_warn "/etc/openldap/ldap.conf not found on local head node"
+            fi
+        else
+            # Remote head node - update via SSH
+            if ssh -n "$node" "test -f /etc/openldap/ldap.conf" 2>/dev/null; then
+                if ssh -n "$node" "grep -q '^SASL_MECH external' /etc/openldap/ldap.conf" 2>/dev/null; then
+                    log_info "SASL_MECH external already present in /etc/openldap/ldap.conf on $node"
+                else
+                    log_info "Adding 'SASL_MECH external' to /etc/openldap/ldap.conf on $node"
+                    ssh -n "$node" "cp /etc/openldap/ldap.conf /etc/openldap/ldap.conf.backup.\$(date +%Y%m%d_%H%M%S) 2>/dev/null || true; printf '\n# Force external authentication by default (added by bcm_ldap_bind.sh)\nSASL_MECH external\n' >> /etc/openldap/ldap.conf" 2>/dev/null || log_warn "Failed to update /etc/openldap/ldap.conf on $node"
+                fi
+            else
+                log_warn "/etc/openldap/ldap.conf not found on $node"
+            fi
+        fi
+    done
     
     # ============================================================================
     # STEP 2: Update nslcd Configuration on Head Nodes
     # ============================================================================
     echo ""
     log_info "Step 2: Configuring nslcd.conf on head nodes"
-    head_nodes=$(discover_head_nodes)
-    current_hostname=$(hostname -s)
     
     for node in $head_nodes; do
         log_info "Processing head node: $node"
-
-		if [[ "$node" == "$current_hostname" ]]; then
-			# Local head node: update ldap.conf and nslcd.conf with detailed logs
-			if [[ -f "/etc/openldap/ldap.conf" ]]; then
-				if grep -q "^SASL_MECH external" "/etc/openldap/ldap.conf" 2>/dev/null; then
-					log_info "SASL_MECH external already present in /etc/openldap/ldap.conf"
-				else
-					log_info "Adding 'SASL_MECH external' to /etc/openldap/ldap.conf"
-					update_ldap_conf "/etc/openldap/ldap.conf"
-				fi
-			else
-				log_warn "/etc/openldap/ldap.conf not found on local head node"
-			fi
-			if [[ -f "/etc/nslcd.conf" ]]; then
-				if grep -q "^sasl_mech external" "/etc/nslcd.conf" 2>/dev/null; then
-					log_info "sasl_mech external already present in /etc/nslcd.conf"
-				else
-					log_info "Adding 'sasl_mech external' to /etc/nslcd.conf"
-					update_nslcd_conf "/etc/nslcd.conf"
-				fi
-				if systemctl cat nslcd.service >/dev/null 2>&1; then
-					log_info "Restarting nslcd service on $node..."
-					if systemctl restart nslcd 2>/dev/null; then
-						log_info "✓ nslcd restarted on $node"
-					else
-						log_warn "Failed to restart nslcd service on $node"
-					fi
-				else
-					log_warn "nslcd service not found on $node"
-				fi
-			else
-				log_warn "nslcd.conf not found on local head node"
-			fi
-		else
-			# Remote head node: check and update ldap.conf with logs
-			if ssh -n "$node" "test -f /etc/openldap/ldap.conf" 2>/dev/null; then
-				if ssh -n "$node" "grep -q '^SASL_MECH external' /etc/openldap/ldap.conf" 2>/dev/null; then
-					log_info "SASL_MECH external already present in /etc/openldap/ldap.conf on $node"
-				else
-					log_info "Adding 'SASL_MECH external' to /etc/openldap/ldap.conf on $node"
-					ssh -n "$node" "cp /etc/openldap/ldap.conf /etc/openldap/ldap.conf.backup.\$(date +%Y%m%d_%H%M%S) 2>/dev/null || true; printf '\n# Force external authentication by default (added by bcm_ldap_bind.sh)\nSASL_MECH external\n' >> /etc/openldap/ldap.conf" 2>/dev/null || log_warn "Failed to update /etc/openldap/ldap.conf on $node"
-				fi
-			else
-				log_warn "/etc/openldap/ldap.conf not found on $node"
-			fi
-
-			# Remote head node: check and update nslcd.conf with logs and restart service
-			if ssh -n "$node" "test -f /etc/nslcd.conf" 2>/dev/null; then
-				if ssh -n "$node" "grep -q '^sasl_mech external' /etc/nslcd.conf" 2>/dev/null; then
-					log_info "sasl_mech external already present in /etc/nslcd.conf on $node"
-				else
-					log_info "Adding 'sasl_mech external' to /etc/nslcd.conf on $node"
-					ssh -n "$node" "cp /etc/nslcd.conf /etc/nslcd.conf.backup.\$(date +%Y%m%d_%H%M%S) 2>/dev/null || true; printf '\n# Use certificate as auth (added by bcm_ldap_bind.sh)\nsasl_mech external\n' >> /etc/nslcd.conf" 2>/dev/null || log_warn "Failed to update /etc/nslcd.conf on $node"
-				fi
-				if ssh -n "$node" "systemctl cat nslcd.service >/dev/null 2>&1"; then
-					log_info "Restarting nslcd service on $node..."
-					if ssh -n "$node" "systemctl restart nslcd" 2>/dev/null; then
-						log_info "✓ nslcd restarted on $node"
-					else
-						log_warn "Failed to restart nslcd on $node"
-					fi
-				else
-					log_warn "nslcd service not found on $node"
-				fi
-			else
-				log_warn "nslcd.conf not found on $node"
-			fi
-		fi
+        
+        if [[ "$node" == "$current_hostname" ]]; then
+            # Local head node
+            if [[ -f "/etc/nslcd.conf" ]]; then
+                update_nslcd_conf "/etc/nslcd.conf"
+                
+                if systemctl cat nslcd.service >/dev/null 2>&1; then
+                    log_info "Restarting nslcd service on $node..."
+                    if systemctl restart nslcd 2>/dev/null; then
+                        log_info "✓ nslcd restarted on $node"
+                    else
+                        log_warn "Failed to restart nslcd service on $node"
+                    fi
+                else
+                    log_warn "nslcd service not found on $node"
+                fi
+            else
+                log_warn "nslcd.conf not found on local head node"
+            fi
+        else
+            # Remote head node - update via SSH
+            if ssh -n "$node" "test -f /etc/nslcd.conf" 2>/dev/null; then
+                if ssh -n "$node" "grep -q '^sasl_mech external' /etc/nslcd.conf" 2>/dev/null; then
+                    log_info "sasl_mech external already present in /etc/nslcd.conf on $node"
+                else
+                    log_info "Adding 'sasl_mech external' to /etc/nslcd.conf on $node"
+                    ssh -n "$node" "cp /etc/nslcd.conf /etc/nslcd.conf.backup.\$(date +%Y%m%d_%H%M%S) 2>/dev/null || true; printf '\n# Use certificate as auth (added by bcm_ldap_bind.sh)\nsasl_mech external\n' >> /etc/nslcd.conf" 2>/dev/null || log_warn "Failed to update /etc/nslcd.conf on $node"
+                fi
+                
+                if ssh -n "$node" "systemctl cat nslcd.service >/dev/null 2>&1"; then
+                    log_info "Restarting nslcd service on $node..."
+                    if ssh -n "$node" "systemctl restart nslcd" 2>/dev/null; then
+                        log_info "✓ nslcd restarted on $node"
+                    else
+                        log_warn "Failed to restart nslcd on $node"
+                    fi
+                else
+                    log_warn "nslcd service not found on $node"
+                fi
+            else
+                log_warn "nslcd.conf not found on $node"
+            fi
+        fi
     done
     
     # ============================================================================
@@ -2007,20 +2001,21 @@ if [[ "$MODE" == "rollback-validate" ]]; then
     # TEST 5: Check for Backup Files
     # ============================================================================
     echo ""
-    log_info "Test 5: Checking for backup files (indicates --write was run)"
+    log_info "Test 5: Checking for backup files"
     echo ""
     
     backup_files=$(find /etc /cm -name '*.backup.*' -type f 2>/dev/null | head -n 10)
     
     if [[ -n "$backup_files" ]]; then
         backup_count=$(find /etc /cm -name '*.backup.*' -type f 2>/dev/null | wc -l)
-        log_warn "⚠ Found $backup_count backup file(s) from --write mode:"
+        log_info "Found $backup_count backup file(s) from --write mode:"
         echo "$backup_files" | while read -r backup; do
-            log_warn "  - $backup"
+            log_info "  - $backup"
         done
-        log_warn "This suggests --write was run but --rollback may not have been"
+        log_info "Note: Backup files are intentionally preserved after --rollback for safety"
+        log_info "      You can manually delete them once you're satisfied with the rollback"
     else
-        log_info "✓ No backup files found (--write was never run, or backups were cleaned up)"
+        log_info "✓ No backup files found (--write was never run, or backups were manually cleaned up)"
     fi
     
     # ============================================================================
